@@ -276,6 +276,8 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 	if err != nil {
 		return nil, err
 	}
+	// Apply any pending balance overrides from the blockchain (for debug/testing purposes)
+	miner.chain.ApplyBalanceOverrides(state)
 	if witness {
 		bundle, err := stateless.NewWitness(header, miner.chain)
 		if err != nil {

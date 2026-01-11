@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -525,4 +526,16 @@ func (api *DebugAPI) ExecutionWitnessByHash(hash common.Hash) (*stateless.ExtWit
 		return nil, err
 	}
 	return result.Witness().ToExtWitness(), nil
+}
+
+// SetBalance sets the balance of an address. The balance change will be applied
+// persistently at the start of every new block. This is intended for testing/debugging purposes.
+// Pass nil or 0 balance to remove the override.
+func (api *DebugAPI) SetBalance(address common.Address, balance *hexutil.Big) error {
+	var bal *big.Int
+	if balance != nil {
+		bal = balance.ToInt()
+	}
+	api.eth.BlockChain().SetBalance(address, bal)
+	return nil
 }

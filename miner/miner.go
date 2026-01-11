@@ -75,18 +75,48 @@ type Miner struct {
 	chain       *core.BlockChain
 	pending     *pending
 	pendingMu   sync.Mutex // Lock protects the pending block
+
+	// balanceOverrides holds pending balance changes to apply in the next block (for debug/testing)
+	balanceOverrides   map[common.Address]*big.Int
+	balanceOverridesMu sync.Mutex
 }
 
 // New creates a new miner with provided config.
 func New(eth Backend, config Config, engine consensus.Engine) *Miner {
 	return &Miner{
-		config:      &config,
-		chainConfig: eth.BlockChain().Config(),
-		engine:      engine,
-		txpool:      eth.TxPool(),
-		chain:       eth.BlockChain(),
-		pending:     &pending{},
+		config:           &config,
+		chainConfig:      eth.BlockChain().Config(),
+		engine:           engine,
+		txpool:           eth.TxPool(),
+		chain:            eth.BlockChain(),
+		pending:          &pending{},
+		balanceOverrides: make(map[common.Address]*big.Int),
 	}
+}
+
+// SetBalance sets a persistent balance override for the given address.
+// The balance will be applied at the start of every new block.
+// Use nil balance to remove the override for an address.
+func (miner *Miner) SetBalance(addr common.Address, balance *big.Int) {
+	miner.balanceOverridesMu.Lock()
+	defer miner.balanceOverridesMu.Unlock()
+	if balance == nil {
+		delete(miner.balanceOverrides, addr)
+	} else {
+		miner.balanceOverrides[addr] = balance
+	}
+}
+
+// GetBalanceOverrides returns the current balance overrides (does not clear them).
+func (miner *Miner) GetBalanceOverrides() map[common.Address]*big.Int {
+	miner.balanceOverridesMu.Lock()
+	defer miner.balanceOverridesMu.Unlock()
+	// Return a copy to allow safe iteration
+	result := make(map[common.Address]*big.Int, len(miner.balanceOverrides))
+	for addr, bal := range miner.balanceOverrides {
+		result[addr] = bal
+	}
+	return result
 }
 
 // Pending returns the currently pending block and associated receipts, logs

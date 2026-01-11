@@ -55,6 +55,7 @@ import (
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
+	"github.com/holiman/uint256"
 )
 
 var (
@@ -345,6 +346,10 @@ type BlockChain struct {
 
 	lastForkReadyAlert time.Time     // Last time there was a fork readiness print out
 	slowBlockThreshold time.Duration // Block execution time threshold beyond which detailed statistics will be logged
+
+	// Balance overrides for debug/testing (applied at start of each block)
+	balanceOverrides   map[common.Address]*big.Int
+	balanceOverridesMu sync.RWMutex
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -393,6 +398,7 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		engine:             engine,
 		logger:             cfg.VmConfig.Tracer,
 		slowBlockThreshold: cfg.SlowBlockThreshold,
+		balanceOverrides:   make(map[common.Address]*big.Int),
 	}
 	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.insertStopped)
 	if err != nil {
@@ -2117,6 +2123,10 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 		}()
 	}
 
+	// Apply any pending balance overrides (for debug/testing purposes)
+	// This must be applied BEFORE processing so verification matches building
+	bc.ApplyBalanceOverrides(statedb)
+
 	// Process block using the parent state as reference point
 	pstart := time.Now()
 	res, err := bc.processor.Process(block, statedb, bc.cfg.VmConfig)
@@ -2877,4 +2887,34 @@ func (bc *BlockChain) GetTrieFlushInterval() time.Duration {
 // StateSizer returns the state size tracker, or nil if it's not initialized
 func (bc *BlockChain) StateSizer() *state.SizeTracker {
 	return bc.stateSizer
+}
+
+// SetBalance sets a persistent balance override for the given address.
+// The balance will be applied at the start of every new block.
+// Use nil balance to remove the override for an address.
+func (bc *BlockChain) SetBalance(addr common.Address, balance *big.Int) {
+	bc.balanceOverridesMu.Lock()
+	defer bc.balanceOverridesMu.Unlock()
+	if balance == nil {
+		delete(bc.balanceOverrides, addr)
+		log.Info("Removed balance override", "address", addr)
+	} else {
+		bc.balanceOverrides[addr] = balance
+		log.Info("Set balance override", "address", addr, "balance", balance)
+	}
+}
+
+// ApplyBalanceOverrides applies any pending balance overrides to the given state.
+// This should be called when creating state for block building or processing.
+func (bc *BlockChain) ApplyBalanceOverrides(statedb *state.StateDB) {
+	bc.balanceOverridesMu.RLock()
+	defer bc.balanceOverridesMu.RUnlock()
+
+	for addr, balance := range bc.balanceOverrides {
+		u256Balance, _ := uint256.FromBig(balance)
+		statedb.SetBalance(addr, u256Balance, tracing.BalanceChangeUnspecified)
+	}
+	if len(bc.balanceOverrides) > 0 {
+		statedb.Finalise(false)
+	}
 }
