@@ -37,10 +37,12 @@ import (
 
 const (
 	// Number of codehash->size associations to keep.
-	codeSizeCacheSize = 1_000_000 // 4 megabytes in total
+	// Set to 0 to disable caching and force all code reads to hit the database.
+	codeSizeCacheSize = 0 // default: 1_000_000
 
 	// Cache size granted for caching clean code.
-	codeCacheSize = 256 * 1024 * 1024
+	// Set to 0 to disable caching and force all code reads to hit the database.
+	codeCacheSize = 0 // default: 256 * 1024 * 1024
 
 	// Number of address->curve point associations to keep.
 	pointCacheSize = 4096
