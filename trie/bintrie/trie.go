@@ -265,15 +265,22 @@ func (t *BinaryTrie) UpdateAccount(addr common.Address, acc *types.StateAccount,
 	values[BasicDataLeafKey] = basicData[:]
 	values[CodeHashLeafKey] = acc.CodeHash[:]
 
-	t.root, err = t.root.InsertValuesAtStem(stem, values, t.nodeResolver, 0)
-	return err
+	newRoot, err := t.root.InsertValuesAtStem(stem, values, t.nodeResolver, 0)
+	if err != nil {
+		return err
+	}
+	t.root = newRoot
+	return nil
 }
 
 // UpdateStem updates the values for the given stem key.
 func (t *BinaryTrie) UpdateStem(key []byte, values [][]byte) error {
-	var err error
-	t.root, err = t.root.InsertValuesAtStem(key, values, t.nodeResolver, 0)
-	return err
+	newRoot, err := t.root.InsertValuesAtStem(key, values, t.nodeResolver, 0)
+	if err != nil {
+		return err
+	}
+	t.root = newRoot
+	return nil
 }
 
 // UpdateStorage associates key with value in the trie. If value has length zero, any

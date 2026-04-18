@@ -217,8 +217,10 @@ func (bt *InternalNode) InsertValuesAtStem(stem []byte, values [][]byte, resolve
 		}
 
 		bt.left, err = bt.left.InsertValuesAtStem(stem, values, resolver, depth+1)
-		bt.mustRecompute = true
-		bt.needsFlush = true
+		if needsRehash(bt.left) {
+			bt.mustRecompute = true
+			bt.needsFlush = true
+		}
 		return bt, err
 	}
 
@@ -243,8 +245,10 @@ func (bt *InternalNode) InsertValuesAtStem(stem []byte, values [][]byte, resolve
 	}
 
 	bt.right, err = bt.right.InsertValuesAtStem(stem, values, resolver, depth+1)
-	bt.mustRecompute = true
-	bt.needsFlush = true
+	if needsRehash(bt.right) {
+		bt.mustRecompute = true
+		bt.needsFlush = true
+	}
 	return bt, err
 }
 
