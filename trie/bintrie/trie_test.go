@@ -886,17 +886,22 @@ func BenchmarkCollectNodes_SparseWrite(b *testing.B) {
 	var newVal [HashSize]byte
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		idx := i % n
-		binary.BigEndian.PutUint64(newVal[24:], uint64(i+1))
+	iter := 0
+	for b.Loop() {
+		idx := iter % n
+		binary.BigEndian.PutUint64(newVal[24:], uint64(iter+1))
 		var err error
 		tr.root, err = tr.root.Insert(keys[idx][:], newVal[:], nil, 0)
 		if err != nil {
-			b.Fatalf("Insert at iter %d: %v", i, err)
+			b.Fatalf("Insert at iter %d: %v", iter, err)
 		}
 		_, ns := tr.Commit(false)
 		if len(ns.Nodes) == 0 {
-			b.Fatalf("iter %d: empty NodeSet", i)
+			b.Fatalf("iter %d: empty NodeSet (expected root-to-leaf path)", iter)
 		}
+		if len(ns.Nodes) > 40 {
+			b.Fatalf("iter %d: NodeSet too large (%d); dirty leak suspected", iter, len(ns.Nodes))
+		}
+		iter++
 	}
 }
