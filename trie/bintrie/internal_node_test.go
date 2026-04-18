@@ -220,6 +220,44 @@ func TestInternalNodeCopy(t *testing.T) {
 	}
 }
 
+// TestInternalNodeCopyPreservesFreshnessFlags asserts Copy() preserves both
+// mustRecompute and needsFlush in every reachable combination. A refactor
+// that drops either would produce silent data loss: CollectNodes would skip
+// the copied node and its parent would flush with a dangling hash.
+func TestInternalNodeCopyPreservesFreshnessFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		mustRecompute bool
+		needsFlush    bool
+	}{
+		{"both-set", true, true},
+		{"hash-clean-blob-stale", false, true},
+		{"both-clean", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rightStem := &StemNode{Stem: make([]byte, 31), Values: make([][]byte, 256), depth: 1}
+			rightStem.Stem[0] = 0x80
+			original := &InternalNode{
+				depth:         0,
+				left:          &StemNode{Stem: make([]byte, 31), Values: make([][]byte, 256), depth: 1},
+				right:         rightStem,
+				mustRecompute: tc.mustRecompute,
+				needsFlush:    tc.needsFlush,
+			}
+			copied, ok := original.Copy().(*InternalNode)
+			if !ok {
+				t.Fatalf("Copy returned %T, want *InternalNode", original.Copy())
+			}
+			if copied.mustRecompute != tc.mustRecompute {
+				t.Errorf("mustRecompute: got %v, want %v", copied.mustRecompute, tc.mustRecompute)
+			}
+			if copied.needsFlush != tc.needsFlush {
+				t.Errorf("needsFlush: got %v, want %v", copied.needsFlush, tc.needsFlush)
+			}
+		})
+	}
+}
+
 // TestInternalNodeHash tests the Hash method
 func TestInternalNodeHash(t *testing.T) {
 	// Create an internal node

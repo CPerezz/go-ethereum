@@ -242,6 +242,42 @@ func TestStemNodeCopy(t *testing.T) {
 	}
 }
 
+// TestStemNodeCopyPreservesFreshnessFlags asserts Copy() preserves both
+// mustRecompute and needsFlush in every reachable combination. A refactor
+// that drops either would silently skip the copied stem on the next
+// CollectNodes — the same class of bug fixed in f57dd2046.
+func TestStemNodeCopyPreservesFreshnessFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		mustRecompute bool
+		needsFlush    bool
+	}{
+		{"both-set", true, true},
+		{"hash-clean-blob-stale", false, true},
+		{"both-clean", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := &StemNode{
+				Stem:          make([]byte, 31),
+				Values:        make([][]byte, 256),
+				depth:         0,
+				mustRecompute: tc.mustRecompute,
+				needsFlush:    tc.needsFlush,
+			}
+			copied, ok := original.Copy().(*StemNode)
+			if !ok {
+				t.Fatalf("Copy returned %T, want *StemNode", original.Copy())
+			}
+			if copied.mustRecompute != tc.mustRecompute {
+				t.Errorf("mustRecompute: got %v, want %v", copied.mustRecompute, tc.mustRecompute)
+			}
+			if copied.needsFlush != tc.needsFlush {
+				t.Errorf("needsFlush: got %v, want %v", copied.needsFlush, tc.needsFlush)
+			}
+		})
+	}
+}
+
 // TestStemNodeHash tests the Hash method
 func TestStemNodeHash(t *testing.T) {
 	stem := make([]byte, 31)

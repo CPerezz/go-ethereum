@@ -815,11 +815,11 @@ func TestBinaryTrieCommitIncremental(t *testing.T) {
 	}
 
 	_, ns1 := tr.Commit(false)
-	if len(ns1.Nodes) == 0 {
-		t.Fatal("first Commit produced empty NodeSet")
-	}
-	if len(ns1.Nodes) < n {
-		t.Fatalf("first Commit: expected at least %d nodes, got %d", n, len(ns1.Nodes))
+	// Every stem (n) plus every resolved internal node (≥ n-1) must appear
+	// in the first-commit NodeSet. A silent undercount (e.g. a missed
+	// needsFlush setter) would drop below 2n-1.
+	if want := 2*n - 1; len(ns1.Nodes) < want {
+		t.Fatalf("first Commit: expected ≥%d nodes (2n-1), got %d", want, len(ns1.Nodes))
 	}
 
 	// Second Commit on the same trie with no modifications: NodeSet must
@@ -840,14 +840,15 @@ func TestBinaryTrieCommitIncremental(t *testing.T) {
 	}
 	_, ns2 := tr.Commit(false)
 
-	// Path length for a binary trie of n=512 stems is bounded by the
-	// internal depth at which the modified stem sits. Allow generous
-	// slack: up to 64 nodes is fine, anywhere near n (512) is a regression.
+	// A single-leaf modification in a 512-stem binary trie flushes a
+	// root-to-leaf path (~log2(n) ≈ 9 internals) plus the modified stem
+	// itself. Upper bound 32 allows slack for split-depth variability
+	// without hiding a dirty-leak that would push size toward n.
 	if len(ns2.Nodes) == 0 {
 		t.Fatal("modified Commit produced empty NodeSet")
 	}
-	if len(ns2.Nodes) > 64 {
-		t.Fatalf("modified Commit: expected small NodeSet, got %d nodes (first Commit had %d)", len(ns2.Nodes), len(ns1.Nodes))
+	if len(ns2.Nodes) > 32 {
+		t.Fatalf("modified Commit: expected ≤32 nodes (path+stem), got %d", len(ns2.Nodes))
 	}
 	if len(ns2.Nodes) >= len(ns1.Nodes) {
 		t.Fatalf("expected second NodeSet (%d) to be smaller than first (%d)", len(ns2.Nodes), len(ns1.Nodes))
