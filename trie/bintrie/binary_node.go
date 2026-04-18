@@ -96,12 +96,13 @@ func DeserializeNode(serialized []byte, depth int) (BinaryNode, error) {
 	return deserializeNode(serialized, depth, common.Hash{}, true, true)
 }
 
-// DeserializeNodeWithHash deserializes a binary trie node from a byte slice, using the provided hash.
+// DeserializeNodeWithHash deserializes a node whose hash is already known and
+// whose blob is already on disk (mustRecompute=false, needsFlush=false).
 func DeserializeNodeWithHash(serialized []byte, depth int, hn common.Hash) (BinaryNode, error) {
 	return deserializeNode(serialized, depth, hn, false, false)
 }
 
-func deserializeNode(serialized []byte, depth int, hn common.Hash, mustRecompute, dirty bool) (BinaryNode, error) {
+func deserializeNode(serialized []byte, depth int, hn common.Hash, mustRecompute, needsFlush bool) (BinaryNode, error) {
 	if len(serialized) == 0 {
 		return Empty{}, nil
 	}
@@ -117,7 +118,7 @@ func deserializeNode(serialized []byte, depth int, hn common.Hash, mustRecompute
 			right:         HashedNode(common.BytesToHash(serialized[33:65])),
 			hash:          hn,
 			mustRecompute: mustRecompute,
-			dirty:         dirty,
+			needsFlush:    needsFlush,
 		}, nil
 	case nodeTypeStem:
 		if len(serialized) < 64 {
@@ -142,7 +143,7 @@ func deserializeNode(serialized []byte, depth int, hn common.Hash, mustRecompute
 			depth:         depth,
 			hash:          hn,
 			mustRecompute: mustRecompute,
-			dirty:         dirty,
+			needsFlush:    needsFlush,
 		}, nil
 	default:
 		return nil, errors.New("invalid node type")

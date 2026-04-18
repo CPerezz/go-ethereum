@@ -26,13 +26,16 @@ import (
 )
 
 // StemNode represents a group of `NodeWith` values sharing the same stem.
+//
+// Invariant: needsFlush=false implies mustRecompute=false. Every mutation
+// that invalidates the cached hash MUST also mark the blob for re-flush.
 type StemNode struct {
 	Stem   []byte   // Stem path to get to StemNodeWidth values
 	Values [][]byte // All values, indexed by the last byte of the key.
 	depth  int      // Depth of the node
 
-	mustRecompute bool        // true if the hash needs to be recomputed
-	dirty         bool        // true if the node's on-disk blob is stale (needs flush)
+	mustRecompute bool        // hash is stale (cleared by Hash)
+	needsFlush    bool        // on-disk blob is stale (cleared by CollectNodes)
 	hash          common.Hash // cached hash when mustRecompute == false
 }
 
@@ -49,11 +52,11 @@ func (bt *StemNode) Insert(key []byte, value []byte, _ NodeResolverFn, depth int
 	if !bytes.Equal(bt.Stem, key[:StemSize]) {
 		bitStem := bt.Stem[bt.depth/8] >> (7 - (bt.depth % 8)) & 1
 
-		n := &InternalNode{depth: bt.depth, mustRecompute: true, dirty: true}
+		n := &InternalNode{depth: bt.depth, mustRecompute: true, needsFlush: true}
 		bt.depth++
 		// bt is re-parented under n and sits at a new path — rewrite its blob.
 		bt.mustRecompute = true
-		bt.dirty = true
+		bt.needsFlush = true
 		var child, other *BinaryNode
 		if bitStem == 0 {
 			n.left = bt
@@ -81,7 +84,7 @@ func (bt *StemNode) Insert(key []byte, value []byte, _ NodeResolverFn, depth int
 				Values:        values[:],
 				depth:         depth + 1,
 				mustRecompute: true,
-				dirty:         true,
+				needsFlush:    true,
 			}
 		}
 		return n, nil
@@ -91,7 +94,7 @@ func (bt *StemNode) Insert(key []byte, value []byte, _ NodeResolverFn, depth int
 	}
 	bt.Values[key[StemSize]] = value
 	bt.mustRecompute = true
-	bt.dirty = true
+	bt.needsFlush = true
 	return bt, nil
 }
 
@@ -107,7 +110,7 @@ func (bt *StemNode) Copy() BinaryNode {
 		depth:         bt.depth,
 		hash:          bt.hash,
 		mustRecompute: bt.mustRecompute,
-		dirty:         bt.dirty,
+		needsFlush:    bt.needsFlush,
 	}
 }
 
@@ -158,14 +161,13 @@ func (bt *StemNode) Hash() common.Hash {
 	return bt.hash
 }
 
-// CollectNodes flushes the stem via the collector when dirty; clean stems
-// are skipped.
+// CollectNodes flushes the stem via flush when needsFlush is set.
 func (bt *StemNode) CollectNodes(path []byte, flush NodeFlushFn) error {
-	if !bt.dirty {
+	if !bt.needsFlush {
 		return nil
 	}
 	flush(path, bt)
-	bt.dirty = false
+	bt.needsFlush = false
 	return nil
 }
 
@@ -183,11 +185,11 @@ func (bt *StemNode) InsertValuesAtStem(key []byte, values [][]byte, _ NodeResolv
 	if !bytes.Equal(bt.Stem, key[:StemSize]) {
 		bitStem := bt.Stem[bt.depth/8] >> (7 - (bt.depth % 8)) & 1
 
-		n := &InternalNode{depth: bt.depth, mustRecompute: true, dirty: true}
+		n := &InternalNode{depth: bt.depth, mustRecompute: true, needsFlush: true}
 		bt.depth++
 		// bt is re-parented under n and sits at a new path — rewrite its blob.
 		bt.mustRecompute = true
-		bt.dirty = true
+		bt.needsFlush = true
 		var child, other *BinaryNode
 		if bitStem == 0 {
 			n.left = bt
@@ -213,18 +215,20 @@ func (bt *StemNode) InsertValuesAtStem(key []byte, values [][]byte, _ NodeResolv
 				Values:        values,
 				depth:         n.depth + 1,
 				mustRecompute: true,
-				dirty:         true,
+				needsFlush:    true,
 			}
 		}
 		return n, nil
 	}
 
-	// same stem, just merge the two value lists
+	// Same stem — merge. If every v is nil this is an intentional no-op
+	// and leaves needsFlush untouched; callers that want an unconditional
+	// dirty mark must pass at least one non-nil value.
 	for i, v := range values {
 		if v != nil {
 			bt.Values[i] = v
 			bt.mustRecompute = true
-			bt.dirty = true
+			bt.needsFlush = true
 		}
 	}
 	return bt, nil

@@ -32,8 +32,8 @@ func parallelDepth() int {
 	return min(bits.Len(uint(runtime.NumCPU())), 8)
 }
 
-// isDirty reports whether a BinaryNode child needs rehashing.
-func isDirty(n BinaryNode) bool {
+// needsRehash reports whether a BinaryNode child needs rehashing.
+func needsRehash(n BinaryNode) bool {
 	switch v := n.(type) {
 	case *InternalNode:
 		return v.mustRecompute
@@ -57,12 +57,15 @@ func keyToPath(depth int, key []byte) ([]byte, error) {
 }
 
 // InternalNode is a binary trie internal node.
+//
+// Invariant: needsFlush=false implies mustRecompute=false. Every mutation
+// that invalidates the cached hash MUST also mark the blob for re-flush.
 type InternalNode struct {
 	left, right BinaryNode
 	depth       int
 
-	mustRecompute bool        // true if the hash needs to be recomputed
-	dirty         bool        // true if the node's on-disk blob is stale (needs flush)
+	mustRecompute bool        // hash is stale (cleared by Hash)
+	needsFlush    bool        // on-disk blob is stale (cleared by CollectNodes)
 	hash          common.Hash // cached hash when mustRecompute == false
 }
 
@@ -136,7 +139,7 @@ func (bt *InternalNode) Copy() BinaryNode {
 		right:         bt.right.Copy(),
 		depth:         bt.depth,
 		mustRecompute: bt.mustRecompute,
-		dirty:         bt.dirty,
+		needsFlush:    bt.needsFlush,
 		hash:          bt.hash,
 	}
 }
@@ -151,7 +154,7 @@ func (bt *InternalNode) Hash() common.Hash {
 	// hash left subtree in a goroutine, right subtree inline, then combine.
 	// Skip goroutine overhead when only one child is dirty (common case
 	// for narrow state updates that touch a single path through the trie).
-	if bt.depth < parallelDepth() && isDirty(bt.left) && isDirty(bt.right) {
+	if bt.depth < parallelDepth() && needsRehash(bt.left) && needsRehash(bt.right) {
 		var input [64]byte
 		var lh common.Hash
 		var wg sync.WaitGroup
@@ -215,7 +218,7 @@ func (bt *InternalNode) InsertValuesAtStem(stem []byte, values [][]byte, resolve
 
 		bt.left, err = bt.left.InsertValuesAtStem(stem, values, resolver, depth+1)
 		bt.mustRecompute = true
-		bt.dirty = true
+		bt.needsFlush = true
 		return bt, err
 	}
 
@@ -241,15 +244,15 @@ func (bt *InternalNode) InsertValuesAtStem(stem []byte, values [][]byte, resolve
 
 	bt.right, err = bt.right.InsertValuesAtStem(stem, values, resolver, depth+1)
 	bt.mustRecompute = true
-	bt.dirty = true
+	bt.needsFlush = true
 	return bt, err
 }
 
-// CollectNodes collects all child nodes at a given path, and flushes it
-// into the provided node collector. Clean subtrees (dirty == false) are
-// skipped.
+// CollectNodes flushes every node that needs flushing via flushfn. Invariant:
+// any ancestor of a node that needs flushing is itself marked, so a clean
+// root means the whole subtree is clean.
 func (bt *InternalNode) CollectNodes(path []byte, flushfn NodeFlushFn) error {
-	if !bt.dirty {
+	if !bt.needsFlush {
 		return nil
 	}
 	if bt.left != nil {
@@ -271,7 +274,7 @@ func (bt *InternalNode) CollectNodes(path []byte, flushfn NodeFlushFn) error {
 		}
 	}
 	flushfn(path, bt)
-	bt.dirty = false
+	bt.needsFlush = false
 	return nil
 }
 

@@ -222,9 +222,9 @@ func TestEmptyGetHeight(t *testing.T) {
 }
 
 // TestEmptyInsertMarksDirty verifies that a StemNode produced by Empty.Insert
-// is marked dirty. Without this, CollectNodes would skip the freshly created
-// stem and its blob would never reach disk, producing "missing trie node"
-// errors on subsequent reads.
+// is marked needsFlush. Without this, CollectNodes would skip the freshly
+// created stem and its blob would never reach disk, producing "missing trie
+// node" errors on subsequent reads.
 func TestEmptyInsertMarksDirty(t *testing.T) {
 	key := make([]byte, 32)
 	key[0] = 0xaa
@@ -238,13 +238,17 @@ func TestEmptyInsertMarksDirty(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *StemNode, got %T", n)
 	}
-	if !sn.dirty {
-		t.Fatalf("stem produced by Empty.Insert must have dirty=true")
+	if !sn.needsFlush {
+		t.Fatalf("stem produced by Empty.Insert must have needsFlush=true")
+	}
+	if !sn.mustRecompute {
+		t.Fatalf("stem produced by Empty.Insert must have mustRecompute=true")
 	}
 }
 
 // TestEmptyInsertValuesAtStemMarksDirty is the analogous guard for the
-// bulk-insert entry point. Fresh stems created here must be dirty.
+// bulk-insert entry point. Fresh stems created here must have both
+// flags set so they are hashed and flushed on the next Commit.
 func TestEmptyInsertValuesAtStemMarksDirty(t *testing.T) {
 	key := make([]byte, 32)
 	key[0] = 0xcc
@@ -258,7 +262,10 @@ func TestEmptyInsertValuesAtStemMarksDirty(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *StemNode, got %T", n)
 	}
-	if !sn.dirty {
-		t.Fatalf("stem produced by Empty.InsertValuesAtStem must have dirty=true")
+	if !sn.needsFlush {
+		t.Fatalf("stem produced by Empty.InsertValuesAtStem must have needsFlush=true")
+	}
+	if !sn.mustRecompute {
+		t.Fatalf("stem produced by Empty.InsertValuesAtStem must have mustRecompute=true")
 	}
 }

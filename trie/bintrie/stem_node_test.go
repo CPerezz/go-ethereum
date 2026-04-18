@@ -376,10 +376,10 @@ func TestStemNodeCollectNodes(t *testing.T) {
 	values[0] = common.HexToHash("0x0101").Bytes()
 
 	node := &StemNode{
-		Stem:   stem,
-		Values: values[:],
-		depth:  0,
-		dirty:  true,
+		Stem:       stem,
+		Values:     values[:],
+		depth:      0,
+		needsFlush: true,
 	}
 
 	var collectedPaths [][]byte
@@ -415,7 +415,7 @@ func TestStemNodeCollectNodes(t *testing.T) {
 }
 
 // TestStemNodeCollectNodesSkipsClean verifies that a clean stem is not
-// flushed, and that flushing a dirty stem clears its dirty flag so that
+// flushed, and that flushing a stem clears its needsFlush flag so that
 // a subsequent CollectNodes on the same node is a no-op.
 func TestStemNodeCollectNodesSkipsClean(t *testing.T) {
 	stem := make([]byte, 31)
@@ -435,15 +435,15 @@ func TestStemNodeCollectNodesSkipsClean(t *testing.T) {
 		t.Fatalf("expected clean stem not to be flushed, got %d", len(collected))
 	}
 
-	node.dirty = true
+	node.needsFlush = true
 	if err := node.CollectNodes([]byte{0}, flushFn); err != nil {
 		t.Fatalf("CollectNodes on dirty stem: %v", err)
 	}
 	if len(collected) != 1 {
 		t.Fatalf("expected dirty stem to be flushed once, got %d", len(collected))
 	}
-	if node.dirty {
-		t.Errorf("stem dirty flag should be cleared after flush")
+	if node.needsFlush {
+		t.Errorf("stem needsFlush should be cleared after flush")
 	}
 
 	collected = nil

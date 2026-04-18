@@ -351,28 +351,28 @@ func TestInternalNodeInsertValuesAtStem(t *testing.T) {
 
 // TestInternalNodeCollectNodes tests CollectNodes method
 func TestInternalNodeCollectNodes(t *testing.T) {
-	// Create an internal node with two stem children. All three are
-	// marked dirty to mirror production semantics — see CollectNodes.
+	// All three nodes are marked needsFlush to mirror production
+	// semantics — see CollectNodes.
 	leftStem := &StemNode{
-		Stem:   make([]byte, 31),
-		Values: make([][]byte, 256),
-		depth:  1,
-		dirty:  true,
+		Stem:       make([]byte, 31),
+		Values:     make([][]byte, 256),
+		depth:      1,
+		needsFlush: true,
 	}
 
 	rightStem := &StemNode{
-		Stem:   make([]byte, 31),
-		Values: make([][]byte, 256),
-		depth:  1,
-		dirty:  true,
+		Stem:       make([]byte, 31),
+		Values:     make([][]byte, 256),
+		depth:      1,
+		needsFlush: true,
 	}
 	rightStem.Stem[0] = 0x80
 
 	node := &InternalNode{
-		depth: 0,
-		left:  leftStem,
-		right: rightStem,
-		dirty: true,
+		depth:      0,
+		left:       leftStem,
+		right:      rightStem,
+		needsFlush: true,
 	}
 
 	var collectedPaths [][]byte
@@ -410,8 +410,8 @@ func TestInternalNodeCollectNodes(t *testing.T) {
 }
 
 // TestInternalNodeCollectNodesSkipsClean verifies clean subtrees are not
-// flushed. A dirty internal node over clean children only flushes itself;
-// a fully clean tree flushes nothing.
+// flushed. A node that needs flushing over clean children only flushes
+// itself; a fully clean tree flushes nothing.
 func TestInternalNodeCollectNodesSkipsClean(t *testing.T) {
 	leftStem := &StemNode{
 		Stem:   make([]byte, 31),
@@ -426,10 +426,10 @@ func TestInternalNodeCollectNodesSkipsClean(t *testing.T) {
 	rightStem.Stem[0] = 0x80
 
 	dirtyParent := &InternalNode{
-		depth: 0,
-		left:  leftStem,
-		right: rightStem,
-		dirty: true,
+		depth:      0,
+		left:       leftStem,
+		right:      rightStem,
+		needsFlush: true,
 	}
 
 	var collected []BinaryNode
@@ -441,8 +441,8 @@ func TestInternalNodeCollectNodesSkipsClean(t *testing.T) {
 	if len(collected) != 1 || collected[0] != dirtyParent {
 		t.Fatalf("expected only the dirty parent to be flushed, got %d nodes", len(collected))
 	}
-	if dirtyParent.dirty {
-		t.Errorf("parent dirty flag should be cleared after flush")
+	if dirtyParent.needsFlush {
+		t.Errorf("parent needsFlush should be cleared after flush")
 	}
 
 	// Second call on the same tree should be a no-op: everything is clean.
