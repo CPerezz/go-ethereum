@@ -27,7 +27,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
 	"github.com/ethereum/go-ethereum/trie/transitiontrie"
@@ -93,6 +92,20 @@ func (s *stateObject) empty() bool {
 	return s.data.Nonce == 0 && s.data.Balance.IsZero() && bytes.Equal(s.data.CodeHash, types.EmptyCodeHash.Bytes())
 }
 
+// mutatedSinceOrigin reports whether the account's consensus fields changed
+// relative to its pre-block origin (ignoring the EIP-8188 tag). A freshly
+// created account (origin == nil) counts as mutated. This excludes touch-only
+// no-ops (e.g. a zero-value call) from bumping last_written_block.
+func (s *stateObject) mutatedSinceOrigin() bool {
+	if s.origin == nil {
+		return true
+	}
+	return s.data.Nonce != s.origin.Nonce ||
+		s.data.Balance.Cmp(s.origin.Balance) != 0 ||
+		s.data.Root != s.origin.Root ||
+		!bytes.Equal(s.data.CodeHash, s.origin.CodeHash)
+}
+
 // newObject creates a state object.
 func newObject(db *StateDB, address common.Address, acct *types.StateAccount) *stateObject {
 	origin := acct
@@ -140,6 +153,11 @@ func (s *stateObject) getTrie() (Trie, error) {
 			return nil, err
 		}
 		s.trie = tr
+	}
+	// Propagate the EIP-8188 write context to the storage trie (MPT only; the
+	// bintrie/verkle path is gated off by eip8188).
+	if st, ok := s.trie.(*trie.StateTrie); ok {
+		st.SetStorageWriteContext(s.db.blockNumber, s.db.eip8188)
 	}
 	return s.trie, nil
 }
@@ -401,12 +419,22 @@ func (s *stateObject) updateRoot() {
 // fulfills the storage diffs into the given accountUpdate struct.
 func (s *stateObject) commitStorage(op *accountUpdate) {
 	var (
-		encode = func(val common.Hash) []byte {
+		// newEnc encodes the post-state slot leaf, stamping it with the current
+		// block when EIP-8188 is active (derive-at-encode).
+		newEnc = func(val common.Hash) []byte {
 			if val == (common.Hash{}) {
 				return nil
 			}
-			blob, _ := rlp.EncodeToBytes(common.TrimLeftZeroes(val[:]))
-			return blob
+			return types.EncodeStorageSlot(common.TrimLeftZeroes(val[:]), s.db.blockNumber, s.db.eip8188)
+		}
+		// originEnc encodes the pre-state slot leaf for pathdb reverse-diffs.
+		// TODO(eip8188): carry the prior leaf's last_written_block (captured at
+		// read time) so a rollback restores byte-exact leaves.
+		originEnc = func(val common.Hash) []byte {
+			if val == (common.Hash{}) {
+				return nil
+			}
+			return types.EncodeStorageSlot(common.TrimLeftZeroes(val[:]), 0, s.db.eip8188)
 		}
 	)
 	for key, val := range s.pendingStorage {
@@ -421,7 +449,7 @@ func (s *stateObject) commitStorage(op *accountUpdate) {
 		if op.storages == nil {
 			op.storages = make(map[common.Hash][]byte)
 		}
-		op.storages[hash] = encode(val)
+		op.storages[hash] = newEnc(val)
 
 		if op.storagesOriginByKey == nil {
 			op.storagesOriginByKey = make(map[common.Hash][]byte)
@@ -429,7 +457,7 @@ func (s *stateObject) commitStorage(op *accountUpdate) {
 		if op.storagesOriginByHash == nil {
 			op.storagesOriginByHash = make(map[common.Hash][]byte)
 		}
-		origin := encode(s.originStorage[key])
+		origin := originEnc(s.originStorage[key])
 		op.storagesOriginByKey[key] = origin
 		op.storagesOriginByHash[hash] = origin
 

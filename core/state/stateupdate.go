@@ -24,7 +24,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb"
 )
@@ -304,13 +303,13 @@ func (sc *stateUpdate) ToTracingUpdate() (*tracing.StateUpdate, error) {
 
 			// Decode the prev and new values
 			if len(encPrev) > 0 {
-				_, decPrev, _, err = rlp.Split(encPrev)
+				decPrev, _, err = types.DecodeStorageSlot(encPrev)
 				if err != nil {
 					return nil, fmt.Errorf("failed to decode prevValue: %v", err)
 				}
 			}
 			if len(encNew) > 0 {
-				_, decNew, _, err = rlp.Split(encNew)
+				decNew, _, err = types.DecodeStorageSlot(encNew)
 				if err != nil {
 					return nil, fmt.Errorf("failed to decode newValue: %v", err)
 				}

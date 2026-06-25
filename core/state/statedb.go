@@ -85,6 +85,12 @@ type StateDB struct {
 	// It will be updated when the Commit is called.
 	originalRoot common.Hash
 
+	// blockNumber is the block currently being processed, used to stamp the
+	// EIP-8188 last-written tag. eip8188 gates that tagging (set per block from
+	// the fork rules); when false the legacy encoding is preserved.
+	blockNumber uint64
+	eip8188     bool
+
 	// This map holds 'live' objects, which will get modified while
 	// processing a state transition.
 	stateObjects map[common.Address]*stateObject
@@ -558,6 +564,12 @@ func (s *StateDB) GetTransientState(addr common.Address, key common.Hash) common
 
 // updateStateObject writes the given object to the trie.
 func (s *StateDB) updateStateObject(obj *stateObject) {
+	// Stamp the EIP-8188 last-written block on a genuine mutation. Gating on
+	// mutatedSinceOrigin excludes touch-only no-ops (e.g. a zero-value call to a
+	// non-empty account) that markUpdate still routes through here.
+	if s.eip8188 && obj.mutatedSinceOrigin() {
+		obj.data.LastWritten = uint32(s.blockNumber)
+	}
 	// Encode the account and update the account trie
 	if err := s.trie.UpdateAccount(obj.Address(), &obj.data, len(obj.code)); err != nil {
 		s.setError(fmt.Errorf("updateStateObject (%x) error: %v", obj.Address(), err))
@@ -672,6 +684,8 @@ func (s *StateDB) Copy() *StateDB {
 		db:                   s.db,
 		reader:               s.reader,
 		originalRoot:         s.originalRoot,
+		blockNumber:          s.blockNumber,
+		eip8188:              s.eip8188,
 		stateObjects:         make(map[common.Address]*stateObject, len(s.stateObjects)),
 		stateObjectsDestruct: make(map[common.Address]*stateObject, len(s.stateObjectsDestruct)),
 		mutations:            make(map[common.Address]*mutation, len(s.mutations)),
@@ -1034,6 +1048,14 @@ func (s *StateDB) SetTxContext(thash common.Hash, ti int) {
 	s.txIndex = ti
 }
 
+// SetBlockContext records the block currently being processed and whether
+// EIP-8188 last-written tagging is active for it. It should be invoked once
+// per block before execution; the default (unset) is the legacy encoding.
+func (s *StateDB) SetBlockContext(number uint64, eip8188 bool) {
+	s.blockNumber = number
+	s.eip8188 = eip8188
+}
+
 func (s *StateDB) clearJournalAndRefund() {
 	s.journal.reset()
 	s.refund = 0
@@ -1217,6 +1239,8 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool, blockNum
 	if s.dbErr != nil {
 		return nil, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
 	}
+	// The committing block is authoritative for EIP-8188 last-written tags.
+	s.blockNumber = blockNumber
 	// Finalize any pending changes and merge everything into the tries
 	s.IntermediateRoot(deleteEmptyObjects)
 

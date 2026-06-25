@@ -68,6 +68,17 @@ type StateTrie struct {
 	db          database.NodeDatabase
 	preimages   preimageStore
 	secKeyCache map[common.Hash][]byte
+
+	// EIP-8188 storage-leaf write context. When writeEIP8188 is set, UpdateStorage
+	// stamps each slot leaf with writeBlock as its last_written_block.
+	writeBlock   uint64
+	writeEIP8188 bool
+}
+
+// SetStorageWriteContext configures EIP-8188 storage-leaf tagging for subsequent
+// UpdateStorage calls. With eip8188 false the legacy bytestring encoding is used.
+func (t *StateTrie) SetStorageWriteContext(block uint64, eip8188 bool) {
+	t.writeBlock, t.writeEIP8188 = block, eip8188
 }
 
 // NewStateTrie creates a trie with an existing root node from a backing database.
@@ -150,7 +161,7 @@ func (t *StateTrie) GetStorage(_ common.Address, key []byte) ([]byte, error) {
 	if err != nil || len(enc) == 0 {
 		return nil, err
 	}
-	_, content, _, err := rlp.Split(enc)
+	content, _, err := types.DecodeStorageSlot(enc)
 	return content, err
 }
 
@@ -199,7 +210,7 @@ func (t *StateTrie) MustUpdate(key, value []byte) {
 // If a node is not found in the database, a MissingNodeError is returned.
 func (t *StateTrie) UpdateStorage(_ common.Address, key, value []byte) error {
 	hk := crypto.Keccak256(key)
-	v, _ := rlp.EncodeToBytes(value)
+	v := types.EncodeStorageSlot(value, t.writeBlock, t.writeEIP8188)
 	err := t.trie.Update(hk, v)
 	if err != nil {
 		return err
