@@ -25,7 +25,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/overlay"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
 	"github.com/ethereum/go-ethereum/trie/transitiontrie"
@@ -63,12 +62,13 @@ type StateReader interface {
 	Account(addr common.Address) (*types.StateAccount, error)
 
 	// Storage retrieves the storage slot associated with a particular account
-	// address and slot key.
+	// address and slot key, along with its EIP-8188 last_written_block (0 when
+	// the slot is legacy/untagged or not present).
 	//
 	// - Returns an empty slot if it does not exist
 	// - Returns an error only if an unexpected issue occurs
 	// - The returned storage slot is safe to modify after the call
-	Storage(addr common.Address, slot common.Hash) (common.Hash, error)
+	Storage(addr common.Address, slot common.Hash) (common.Hash, uint32, error)
 }
 
 // Reader defines the interface for accessing accounts, storage slots and contract
@@ -127,25 +127,25 @@ func (r *flatReader) Account(addr common.Address) (*types.StateAccount, error) {
 // the requested storage slot is not yet covered by the snapshot.
 //
 // The returned storage slot might be empty if it's not existent.
-func (r *flatReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
+func (r *flatReader) Storage(addr common.Address, key common.Hash) (common.Hash, uint32, error) {
 	addrHash := crypto.Keccak256Hash(addr[:])
 	slotHash := crypto.Keccak256Hash(key[:])
 	ret, err := r.reader.Storage(addrHash, slotHash)
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, 0, err
 	}
 	if len(ret) == 0 {
-		return common.Hash{}, nil
+		return common.Hash{}, 0, nil
 	}
-	// Perform the rlp-decode as the slot value is RLP-encoded in the state
-	// snapshot.
-	_, content, _, err := rlp.Split(ret)
+	// Decode the EIP-8188-aware slot leaf: a legacy bytestring or an [value, lwb]
+	// list, distinguished by the RLP prefix.
+	content, lwb, err := types.DecodeStorageSlot(ret)
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, 0, err
 	}
 	var value common.Hash
 	value.SetBytes(content)
-	return value, nil
+	return value, uint32(lwb), nil
 }
 
 // trieReader implements the StateReader interface, providing functions to access
@@ -250,7 +250,7 @@ func (r *trieReader) Account(addr common.Address) (*types.StateAccount, error) {
 //
 // An error will be returned if the trie state is corrupted. An empty storage
 // slot will be returned if it's not existent in the trie.
-func (r *trieReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
+func (r *trieReader) Storage(addr common.Address, key common.Hash) (common.Hash, uint32, error) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
@@ -271,24 +271,33 @@ func (r *trieReader) Storage(addr common.Address, key common.Hash) (common.Hash,
 			if !ok {
 				_, err := r.account(addr)
 				if err != nil {
-					return common.Hash{}, err
+					return common.Hash{}, 0, err
 				}
 				root = r.subRoots[addr]
 			}
 			var err error
 			tr, err = trie.NewStateTrie(trie.StorageTrieID(r.root, crypto.Keccak256Hash(addr.Bytes()), root), r.db)
 			if err != nil {
-				return common.Hash{}, err
+				return common.Hash{}, 0, err
 			}
 			r.subTries[addr] = tr
 		}
 	}
+	// Surface the EIP-8188 last_written_block from the MPT leaf when possible.
+	if st, ok := tr.(*trie.StateTrie); ok {
+		ret, lwb, err := st.GetStorageWithMeta(addr, key.Bytes())
+		if err != nil {
+			return common.Hash{}, 0, err
+		}
+		value.SetBytes(ret)
+		return value, lwb, nil
+	}
 	ret, err := tr.GetStorage(addr, key.Bytes())
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, 0, err
 	}
 	value.SetBytes(ret)
-	return value, nil
+	return value, 0, nil
 }
 
 // multiStateReader is the aggregation of a list of StateReader interface,
@@ -337,16 +346,23 @@ func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, er
 // - Returns an empty slot if it does not exist
 // - Returns an error only if an unexpected issue occurs
 // - The returned storage slot is safe to modify after the call
-func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
+func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (common.Hash, uint32, error) {
 	var errs []error
 	for _, reader := range r.readers {
-		slot, err := reader.Storage(addr, slot)
+		value, lwb, err := reader.Storage(addr, slot)
 		if err == nil {
-			return slot, nil
+			return value, lwb, nil
 		}
 		errs = append(errs, err)
 	}
-	return common.Hash{}, errors.Join(errs...)
+	return common.Hash{}, 0, errors.Join(errs...)
+}
+
+// cachedSlot bundles a storage slot value with its EIP-8188 last_written_block
+// so the cache can serve both in one lookup.
+type cachedSlot struct {
+	value common.Hash
+	lwb   uint32
 }
 
 // stateReaderWithCache is a wrapper around StateReader that maintains additional
@@ -364,7 +380,7 @@ type stateReaderWithCache struct {
 	// the overhead caused by locking.
 	storageBuckets [16]struct {
 		lock     sync.RWMutex
-		storages map[common.Address]map[common.Hash]common.Hash
+		storages map[common.Address]map[common.Hash]cachedSlot
 	}
 }
 
@@ -375,7 +391,7 @@ func newStateReaderWithCache(sr StateReader) *stateReaderWithCache {
 		accounts:    make(map[common.Address]*types.StateAccount),
 	}
 	for i := range r.storageBuckets {
-		r.storageBuckets[i].storages = make(map[common.Address]map[common.Hash]common.Hash)
+		r.storageBuckets[i].storages = make(map[common.Address]map[common.Hash]cachedSlot)
 	}
 	return r
 }
@@ -416,9 +432,9 @@ func (r *stateReaderWithCache) Account(addr common.Address) (*types.StateAccount
 // storage retrieves the storage slot specified by the address and slot key, along
 // with a flag indicating whether it's found in the cache or not. The returned
 // storage slot might be empty if it's not existent.
-func (r *stateReaderWithCache) storage(addr common.Address, slot common.Hash) (common.Hash, bool, error) {
+func (r *stateReaderWithCache) storage(addr common.Address, slot common.Hash) (common.Hash, uint32, bool, error) {
 	var (
-		value  common.Hash
+		entry  cachedSlot
 		ok     bool
 		bucket = &r.storageBuckets[addr[0]&0x0f]
 	)
@@ -426,27 +442,27 @@ func (r *stateReaderWithCache) storage(addr common.Address, slot common.Hash) (c
 	bucket.lock.RLock()
 	slots, ok := bucket.storages[addr]
 	if ok {
-		value, ok = slots[slot]
+		entry, ok = slots[slot]
 	}
 	bucket.lock.RUnlock()
 	if ok {
-		return value, true, nil
+		return entry.value, entry.lwb, true, nil
 	}
 	// Try to resolve the requested storage slot from the underlying reader
-	value, err := r.StateReader.Storage(addr, slot)
+	value, lwb, err := r.StateReader.Storage(addr, slot)
 	if err != nil {
-		return common.Hash{}, false, err
+		return common.Hash{}, 0, false, err
 	}
 	bucket.lock.Lock()
 	slots, ok = bucket.storages[addr]
 	if !ok {
-		slots = make(map[common.Hash]common.Hash)
+		slots = make(map[common.Hash]cachedSlot)
 		bucket.storages[addr] = slots
 	}
-	slots[slot] = value
+	slots[slot] = cachedSlot{value: value, lwb: lwb}
 	bucket.lock.Unlock()
 
-	return value, false, nil
+	return value, lwb, false, nil
 }
 
 // Storage implements StateReader, retrieving the storage slot specified by the
@@ -454,9 +470,9 @@ func (r *stateReaderWithCache) storage(addr common.Address, slot common.Hash) (c
 // existent.
 //
 // An error will be returned if the state is corrupted in the underlying reader.
-func (r *stateReaderWithCache) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
-	value, _, err := r.storage(addr, slot)
-	return value, err
+func (r *stateReaderWithCache) Storage(addr common.Address, slot common.Hash) (common.Hash, uint32, error) {
+	value, lwb, _, err := r.storage(addr, slot)
+	return value, lwb, err
 }
 
 // stateReaderWithStats is a wrapper over the stateReaderWithCache, tracking
@@ -499,17 +515,17 @@ func (r *stateReaderWithStats) Account(addr common.Address) (*types.StateAccount
 // existent.
 //
 // An error will be returned if the state is corrupted in the underlying reader.
-func (r *stateReaderWithStats) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
-	value, incache, err := r.stateReaderWithCache.storage(addr, slot)
+func (r *stateReaderWithStats) Storage(addr common.Address, slot common.Hash) (common.Hash, uint32, error) {
+	value, lwb, incache, err := r.stateReaderWithCache.storage(addr, slot)
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, 0, err
 	}
 	if incache {
 		r.storageCacheHit.Add(1)
 	} else {
 		r.storageCacheMiss.Add(1)
 	}
-	return value, nil
+	return value, lwb, nil
 }
 
 // GetStateStats implements StateReaderStater, returning the statistics of the

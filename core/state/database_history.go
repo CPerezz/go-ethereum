@@ -25,7 +25,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/database"
@@ -78,24 +77,24 @@ func (r *historicStateReader) Account(addr common.Address) (*types.StateAccount,
 // the requested storage slot is not yet covered by the snapshot.
 //
 // The returned storage slot might be empty if it's not existent.
-func (r *historicStateReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
+func (r *historicStateReader) Storage(addr common.Address, key common.Hash) (common.Hash, uint32, error) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
 	blob, err := r.reader.Storage(addr, key)
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, 0, err
 	}
 	if len(blob) == 0 {
-		return common.Hash{}, nil
+		return common.Hash{}, 0, nil
 	}
-	_, content, _, err := rlp.Split(blob)
+	content, lwb, err := types.DecodeStorageSlot(blob)
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, 0, err
 	}
 	var slot common.Hash
 	slot.SetBytes(content)
-	return slot, nil
+	return slot, uint32(lwb), nil
 }
 
 // historicTrieOpener is a wrapper of pathdb.HistoricalNodeReader, implementing
@@ -184,7 +183,7 @@ func (r *historicalTrieReader) Account(addr common.Address) (*types.StateAccount
 // the requested storage slot is not yet covered by the snapshot.
 //
 // The returned storage slot might be empty if it's not existent.
-func (r *historicalTrieReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
+func (r *historicalTrieReader) Storage(addr common.Address, key common.Hash) (common.Hash, uint32, error) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
@@ -197,24 +196,25 @@ func (r *historicalTrieReader) Storage(addr common.Address, key common.Hash) (co
 		if !ok {
 			_, err := r.account(addr)
 			if err != nil {
-				return common.Hash{}, err
+				return common.Hash{}, 0, err
 			}
 			root = r.subRoots[addr]
 		}
 		var err error
 		tr, err = trie.NewStateTrie(trie.StorageTrieID(r.root, crypto.Keccak256Hash(addr.Bytes()), root), r.opener)
 		if err != nil {
-			return common.Hash{}, err
+			return common.Hash{}, 0, err
 		}
 		r.subTries[addr] = tr
 	}
 	ret, err := tr.GetStorage(addr, key.Bytes())
 	if err != nil {
-		return common.Hash{}, err
+		return common.Hash{}, 0, err
 	}
 	var value common.Hash
 	value.SetBytes(ret)
-	return value, nil
+	// The last_written_block is not surfaced on the historical trie path.
+	return value, 0, nil
 }
 
 // HistoricDB is the implementation of Database interface, with the ability to

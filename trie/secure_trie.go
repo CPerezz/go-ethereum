@@ -165,6 +165,17 @@ func (t *StateTrie) GetStorage(_ common.Address, key []byte) ([]byte, error) {
 	return content, err
 }
 
+// GetStorageWithMeta is like GetStorage but also returns the slot's EIP-8188
+// last_written_block (0 for legacy or absent slots).
+func (t *StateTrie) GetStorageWithMeta(_ common.Address, key []byte) ([]byte, uint32, error) {
+	enc, err := t.trie.Get(crypto.Keccak256(key))
+	if err != nil || len(enc) == 0 {
+		return nil, 0, err
+	}
+	content, lwb, err := types.DecodeStorageSlot(enc)
+	return content, uint32(lwb), err
+}
+
 // PrefetchStorage attempts to resolve specific storage slots from the database
 // to accelerate subsequent trie operations.
 func (t *StateTrie) PrefetchStorage(_ common.Address, keys [][]byte) error {

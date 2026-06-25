@@ -61,6 +61,11 @@ type stateObject struct {
 	dirtyStorage   Storage // Storage entries that have been modified within the current transaction
 	pendingStorage Storage // Storage entries that have been modified within the current block
 
+	// originStorageLwb mirrors originStorage with each slot's prior EIP-8188
+	// last_written_block, captured at read time so commit can re-encode the
+	// pre-state leaf byte-exactly for pathdb reverse-diffs.
+	originStorageLwb map[common.Hash]uint32
+
 	// uncommittedStorage tracks a set of storage entries that have been modified
 	// but not yet committed since the "last commit operation", along with their
 	// original values before mutation.
@@ -118,6 +123,7 @@ func newObject(db *StateDB, address common.Address, acct *types.StateAccount) *s
 		origin:             origin,
 		data:               *acct,
 		originStorage:      make(Storage),
+		originStorageLwb:   make(map[common.Hash]uint32),
 		dirtyStorage:       make(Storage),
 		pendingStorage:     make(Storage),
 		uncommittedStorage: make(Storage),
@@ -222,17 +228,18 @@ func (s *stateObject) GetCommittedState(key common.Hash) common.Hash {
 		//
 		// TODO(rjl493456442) the reader interface can be extended with
 		// Touch, recording the read access without the actual disk load.
-		_, err := s.db.reader.Storage(s.address, key)
+		_, _, err := s.db.reader.Storage(s.address, key)
 		if err != nil {
 			s.db.setError(err)
 		}
 		s.originStorage[key] = common.Hash{} // track the empty slot as origin value
+		s.originStorageLwb[key] = 0
 		return common.Hash{}
 	}
 	s.db.StorageLoaded++
 
 	start := time.Now()
-	value, err := s.db.reader.Storage(s.address, key)
+	value, lwb, err := s.db.reader.Storage(s.address, key)
 	if err != nil {
 		s.db.setError(err)
 		return common.Hash{}
@@ -246,6 +253,7 @@ func (s *stateObject) GetCommittedState(key common.Hash) common.Hash {
 		}
 	}
 	s.originStorage[key] = value
+	s.originStorageLwb[key] = lwb
 	return value
 }
 
@@ -427,14 +435,13 @@ func (s *stateObject) commitStorage(op *accountUpdate) {
 			}
 			return types.EncodeStorageSlot(common.TrimLeftZeroes(val[:]), s.db.blockNumber, s.db.eip8188)
 		}
-		// originEnc encodes the pre-state slot leaf for pathdb reverse-diffs.
-		// TODO(eip8188): carry the prior leaf's last_written_block (captured at
-		// read time) so a rollback restores byte-exact leaves.
-		originEnc = func(val common.Hash) []byte {
+		// originEnc encodes the pre-state slot leaf with its prior last_written_block
+		// (captured at read time) so pathdb reverse-diffs restore byte-exact leaves.
+		originEnc = func(val common.Hash, lwb uint32) []byte {
 			if val == (common.Hash{}) {
 				return nil
 			}
-			return types.EncodeStorageSlot(common.TrimLeftZeroes(val[:]), 0, s.db.eip8188)
+			return types.EncodeStorageSlot(common.TrimLeftZeroes(val[:]), uint64(lwb), s.db.eip8188)
 		}
 	)
 	for key, val := range s.pendingStorage {
@@ -457,12 +464,14 @@ func (s *stateObject) commitStorage(op *accountUpdate) {
 		if op.storagesOriginByHash == nil {
 			op.storagesOriginByHash = make(map[common.Hash][]byte)
 		}
-		origin := originEnc(s.originStorage[key])
+		origin := originEnc(s.originStorage[key], s.originStorageLwb[key])
 		op.storagesOriginByKey[key] = origin
 		op.storagesOriginByHash[hash] = origin
 
-		// Overwrite the clean value of storage slots
+		// Overwrite the clean value of storage slots and record the block that
+		// just wrote them, so a later overwrite encodes the correct prior lwb.
 		s.originStorage[key] = val
+		s.originStorageLwb[key] = uint32(s.db.blockNumber)
 	}
 	s.pendingStorage = make(Storage)
 }
@@ -552,6 +561,7 @@ func (s *stateObject) deepCopy(db *StateDB) *stateObject {
 		data:               s.data,
 		code:               s.code,
 		originStorage:      s.originStorage.Copy(),
+		originStorageLwb:   maps.Clone(s.originStorageLwb),
 		pendingStorage:     s.pendingStorage.Copy(),
 		dirtyStorage:       s.dirtyStorage.Copy(),
 		uncommittedStorage: s.uncommittedStorage.Copy(),

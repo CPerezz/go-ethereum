@@ -118,3 +118,51 @@ func TestEIP8188WritePathTagging(t *testing.T) {
 		t.Fatalf("fork-on slot: value=%x lwb=%d want value=%x lwb=%d", v, lwb, eip8188Val, block)
 	}
 }
+
+// When a slot written at block P is overwritten at block N, the pathdb origin
+// (reverse-diff) leaf must carry the prior last_written_block P so a rollback
+// restores byte-exact leaves.
+func TestEIP8188OriginCarriesPriorLwb(t *testing.T) {
+	const blockP, blockN = uint64(100), uint64(200)
+	db := NewDatabaseForTesting()
+
+	// Block P: create the account and write slot = 0x11.
+	st1, err := New(types.EmptyRootHash, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1.SetBlockContext(blockP, true)
+	st1.SetBalance(eip8188Addr, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
+	st1.SetState(eip8188Addr, eip8188Slot, common.HexToHash("0x11"))
+	root1, err := st1.Commit(blockP, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.TrieDB().Commit(root1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block N: overwrite slot = 0x22; capture the resulting state update.
+	st2, err := New(root1, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2.SetBlockContext(blockN, true)
+	st2.SetState(eip8188Addr, eip8188Slot, common.HexToHash("0x22"))
+	_, update, err := st2.CommitWithUpdate(blockN, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originBlob := update.storagesOrigin[eip8188Addr][crypto.Keccak256Hash(eip8188Slot.Bytes())]
+	val, lwb, err := types.DecodeStorageSlot(originBlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if common.BytesToHash(val) != common.HexToHash("0x11") {
+		t.Fatalf("origin value: got %x want 0x11", val)
+	}
+	if lwb != blockP {
+		t.Fatalf("origin lwb: got %d want %d", lwb, blockP)
+	}
+}
