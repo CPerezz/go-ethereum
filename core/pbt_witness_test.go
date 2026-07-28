@@ -49,13 +49,23 @@ var (
 		MuirGlacierBlock:        big.NewInt(0),
 		BerlinBlock:             big.NewInt(0),
 		LondonBlock:             big.NewInt(0),
+		MergeNetsplitBlock:      big.NewInt(0),
 		Ethash:                  new(params.EthashConfig),
 		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
+		AmsterdamTime:           u64(0),
 		PBTTime:                 u64(0),
 		TerminalTotalDifficulty: common.Big0,
 		EnablePBTAtGenesis:      true,
+		DepositContractAddress:  params.MainnetChainConfig.DepositContractAddress,
 		BlobScheduleConfig: &params.BlobScheduleConfig{
-			Verkle: params.DefaultPragueBlobConfig,
+			Cancun:    params.DefaultCancunBlobConfig,
+			Prague:    params.DefaultPragueBlobConfig,
+			Osaka:     params.DefaultOsakaBlobConfig,
+			Amsterdam: params.DefaultAmsterdamBlobConfig,
+			Verkle:    params.DefaultPragueBlobConfig,
 		},
 	}
 )
@@ -92,7 +102,10 @@ func TestProcessPBT(t *testing.T) {
 	// genesis := gspec.MustCommit(bcdb, triedb)
 	options := DefaultConfig().WithStateScheme(rawdb.PathScheme)
 	options.SnapshotLimit = 0
-	blockchain, _ := NewBlockChain(bcdb, gspec, beacon.New(ethash.NewFaker()), options)
+	blockchain, err := NewBlockChain(bcdb, gspec, beacon.New(ethash.NewFaker()), options)
+	if err != nil {
+		t.Fatalf("failed to create chain: %v", err)
+	}
 	defer blockchain.Stop()
 
 	txCost1 := params.TxGas

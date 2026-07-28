@@ -392,12 +392,18 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			misc.ApplyDAOHardFork(statedb)
 		}
 
-		if config.IsPrague(b.header.Number, b.header.Time) || config.IsPBT(b.header.Number, b.header.Time) {
-			// EIP-2935
+		// Mirror the system calls block processing makes, in the same order,
+		// so a generated chain and an imported one agree on the state root.
+		if b.header.ParentBeaconRoot != nil || config.IsPrague(b.header.Number, b.header.Time) || config.IsPBT(b.header.Number, b.header.Time) {
 			blockContext := NewEVMBlockContext(b.header, cm, &b.header.Coinbase)
 			blockContext.Random = &common.Hash{} // enable post-merge instruction set
 			evm := vm.NewEVM(blockContext, statedb, cm.config, vm.Config{})
-			ProcessParentBlockHash(b.header.ParentHash, evm)
+			if b.header.ParentBeaconRoot != nil {
+				ProcessBeaconBlockRoot(*b.header.ParentBeaconRoot, evm) // EIP-4788
+			}
+			if config.IsPrague(b.header.Number, b.header.Time) || config.IsPBT(b.header.Number, b.header.Time) {
+				ProcessParentBlockHash(b.header.ParentHash, evm) // EIP-2935
+			}
 		}
 
 		// Execute any user modifications to the block
@@ -518,6 +524,17 @@ func (cm *chainMaker) makeHeader(parent *types.Block, state *state.StateDB, engi
 		header.ExcessBlobGas = &excessBlobGas
 		header.BlobGasUsed = new(uint64)
 		header.ParentBeaconRoot = new(common.Hash)
+	}
+	if cm.config.IsAmsterdam(header.Number, header.Time) {
+		// EIP-7843: generated blocks carry the block number as their slot,
+		// which is what the miner does for a chain without missed slots.
+		slot := header.Number.Uint64()
+		header.SlotNumber = &slot
+		// EIP-7928: header verification requires the field to be present, but
+		// nothing in the tree builds a block access list yet, so generated
+		// blocks carry the zero hash. This must become the real commitment
+		// when block access lists land.
+		header.BlockAccessListHash = new(common.Hash)
 	}
 	return header
 }

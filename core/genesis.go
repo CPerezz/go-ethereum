@@ -554,6 +554,12 @@ func (g *Genesis) toBlockWithRoot(root common.Hash) *types.Block {
 			if head.SlotNumber == nil {
 				head.SlotNumber = new(uint64)
 			}
+			// EIP-7928: the block access list hash precedes the slot number
+			// among the header's optional fields, so it has to be present for
+			// the header to encode at all. Genesis has no access list.
+			if head.BlockAccessListHash == nil {
+				head.BlockAccessListHash = new(common.Hash)
+			}
 		}
 	}
 	return types.NewBlock(head, &types.Body{Withdrawals: withdrawals}, nil, trie.NewStackTrie(nil))
