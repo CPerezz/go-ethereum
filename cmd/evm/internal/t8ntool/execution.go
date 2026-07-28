@@ -40,12 +40,13 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
 )
 
 type Prestate struct {
-	Env        stEnv                         `json:"env"`
-	Pre        types.GenesisAlloc            `json:"pre"`
+	Env        stEnv                    `json:"env"`
+	Pre        types.GenesisAlloc       `json:"pre"`
 	TreeLeaves map[string]hexutil.Bytes `json:"vkt,omitempty"`
 }
 
@@ -378,7 +379,13 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig, 
 }
 
 func MakePreState(db ethdb.Database, accounts types.GenesisAlloc, isBintrie bool) *state.StateDB {
-	tdb := triedb.NewDatabase(db, &triedb.Config{Preimages: true, IsPBT: isBintrie})
+	config := &triedb.Config{Preimages: true, IsPBT: isBintrie}
+	if isBintrie {
+		// The binary tree is path-scheme only; the default hash-scheme
+		// backend cannot store its node set.
+		config.PathDB = pathdb.Defaults
+	}
+	tdb := triedb.NewDatabase(db, config)
 	sdb := state.NewDatabase(tdb, nil)
 
 	root := types.EmptyRootHash
@@ -402,11 +409,8 @@ func MakePreState(db ethdb.Database, accounts types.GenesisAlloc, isBintrie bool
 	if err != nil {
 		panic(fmt.Errorf("failed to commit initial state: %v", err))
 	}
-	// If bintrie mode started, check if conversion happened
-	if isBintrie {
-		return statedb
-	}
-	// For MPT mode, reopen the state with the committed root
+	// Reopen at the committed root: a committed trie is spent, whichever
+	// tree backs it.
 	statedb, err = state.New(root, sdb)
 	if err != nil {
 		panic(fmt.Errorf("failed to reopen state after commit: %v", err))
