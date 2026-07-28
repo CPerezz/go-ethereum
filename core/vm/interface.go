@@ -53,6 +53,10 @@ type StateDB interface {
 	GetState(common.Address, common.Hash) common.Hash
 	SetState(common.Address, common.Hash, common.Hash) common.Hash
 	GetStorageRoot(addr common.Address) common.Hash
+	// HasStorage reports whether the account holds any storage. It exists
+	// alongside GetStorageRoot because the binary tree has no per-account
+	// storage root to compare against the empty-trie sentinel.
+	HasStorage(addr common.Address) bool
 
 	GetTransientState(addr common.Address, key common.Hash) common.Hash
 	SetTransientState(addr common.Address, key, value common.Hash)
