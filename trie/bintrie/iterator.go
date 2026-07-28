@@ -1,4 +1,4 @@
-// Copyright 2025 The go-ethereum Authors
+// Copyright 2026 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -17,288 +17,302 @@
 package bintrie
 
 import (
+	"bytes"
 	"errors"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/trie"
 )
 
+// errIteratorEnd is stored in nodeIterator.err when iteration is done.
 var errIteratorEnd = errors.New("end of iteration")
 
-type binaryNodeIteratorState struct {
-	Node  BinaryNode
-	Index int
+// nodeIterator walks the trie in pre-order; leaves surface one at a time in
+// ascending key order (bit-lexicographic, which per zone equals byte order).
+type nodeIterator struct {
+	trie  *BinaryTrie
+	stack []*iterState
+	err   error
 }
 
-type binaryNodeIterator struct {
-	trie    *BinaryTrie
-	current BinaryNode
-	lastErr error
-
-	stack []binaryNodeIteratorState
+type iterState struct {
+	node    binaryNode
+	walk    bitstr // bits consumed above the node
+	pos     int    // == walk.n
+	valIdx  int    // next value index within a group (-1 before descent)
+	visited bool   // node itself already emitted
 }
 
-func newBinaryNodeIterator(t *BinaryTrie, _ []byte) (trie.NodeIterator, error) {
-	if t.Hash() == zero {
-		return &binaryNodeIterator{trie: t, lastErr: errIteratorEnd}, nil
+// NodeIterator returns an iterator over the trie's nodes and leaves,
+// starting at the first leaf with key >= start.
+func (t *BinaryTrie) NodeIterator(start []byte) (trie.NodeIterator, error) {
+	if t.committed {
+		return nil, trie.ErrCommitted
 	}
-	it := &binaryNodeIterator{trie: t, current: t.root}
-	// it.err = it.seek(start)
+	it := &nodeIterator{trie: t}
+	it.stack = append(it.stack, &iterState{node: t.root, valIdx: -1})
+	if len(start) > 0 {
+		it.seek(start)
+	}
 	return it, nil
 }
 
-// Next moves the iterator to the next node. If the parameter is false, any child
-// nodes will be skipped.
-func (it *binaryNodeIterator) Next(descend bool) bool {
-	if it.lastErr == errIteratorEnd {
-		it.lastErr = errIteratorEnd
-		return false
-	}
-
-	if len(it.stack) == 0 {
-		it.stack = append(it.stack, binaryNodeIteratorState{Node: it.trie.root})
-		it.current = it.trie.root
-
-		return true
-	}
-
-	switch node := it.current.(type) {
-	case *InternalNode:
-		// index: 0 = nothing visited, 1=left visited, 2=right visited
-		context := &it.stack[len(it.stack)-1]
-
-		// recurse into both children
-		if context.Index == 0 {
-			if _, isempty := node.left.(Empty); node.left != nil && !isempty {
-				it.stack = append(it.stack, binaryNodeIteratorState{Node: node.left})
-				it.current = node.left
-				return it.Next(descend)
+// seek discards subtrees strictly before the start key.
+func (it *nodeIterator) seek(start []byte) {
+	// The root frame is on the stack; descend greedily, pruning left
+	// subtrees whose keys all sort below start.
+	for {
+		st := it.stack[len(it.stack)-1]
+		switch n := st.node.(type) {
+		case hashedNode:
+			resolved, err := it.trie.resolve(n, st.walk)
+			if err != nil {
+				it.err = err
+				return
 			}
-
-			context.Index++
-		}
-
-		if context.Index == 1 {
-			if _, isempty := node.right.(Empty); node.right != nil && !isempty {
-				it.stack = append(it.stack, binaryNodeIteratorState{Node: node.right})
-				it.current = node.right
-				return it.Next(descend)
+			st.node = resolved
+		case *groupNode:
+			// Position valIdx at the first value with key >= start.
+			st.visited = true
+			st.valIdx = len(n.subs)
+			for i, sub := range n.subs {
+				key := append(append([]byte{}, n.stem...), sub)
+				if bytes.Compare(key, start) >= 0 {
+					st.valIdx = i
+					break
+				}
 			}
-
-			context.Index++
-		}
-
-		// Reached the end of this node, go back to the parent, if
-		// this isn't root.
-		if len(it.stack) == 1 {
-			it.lastErr = errIteratorEnd
-			return false
-		}
-		it.stack = it.stack[:len(it.stack)-1]
-		it.current = it.stack[len(it.stack)-1].Node
-		it.stack[len(it.stack)-1].Index++
-		return it.Next(descend)
-	case *StemNode:
-		// Look for the next non-empty value
-		for i := it.stack[len(it.stack)-1].Index; i < 256; i++ {
-			if node.Values[i] != nil {
-				it.stack[len(it.stack)-1].Index = i + 1
-				return true
+			return
+		case *branchNode:
+			st.visited = true
+			split := st.pos + n.prefix.n
+			// Compare start against the subtree's key range: if the walked
+			// prefix already exceeds start, the whole subtree qualifies; if
+			// it sorts below, only the right side may qualify.
+			m := n.prefix.matchKey(start, min(st.pos, 8*len(start)))
+			if st.pos >= 8*len(start) || m < n.prefix.n && n.prefix.bit(m) == 1 {
+				// Subtree keys sort >= start entirely: emit from the left.
+				it.push(n, st.walk, split, 0)
+				continue
 			}
-		}
-
-		// go back to parent to get the next leaf
-		// Check if we're at the root before popping
-		if len(it.stack) == 1 {
-			it.lastErr = errIteratorEnd
-			return false
-		}
-		it.stack = it.stack[:len(it.stack)-1]
-		it.current = it.stack[len(it.stack)-1].Node
-		it.stack[len(it.stack)-1].Index++
-		return it.Next(descend)
-	case HashedNode:
-		// resolve the node
-		resolverPath := it.Path()
-		data, err := it.trie.nodeResolver(resolverPath, common.Hash(node))
-		if err != nil {
-			panic(err)
-		}
-		if data == nil {
-			// Empty/nil node — treat as Empty, backtrack
-			it.current = Empty{}
-			it.stack[len(it.stack)-1].Node = it.current
-			return it.Next(descend)
-		}
-		it.current, err = DeserializeNodeWithHash(data, len(it.stack)-1, common.Hash(node))
-		if err != nil {
-			panic(err)
-		}
-
-		// update the stack and parent with the resolved node
-		it.stack[len(it.stack)-1].Node = it.current
-		if len(it.stack) >= 2 {
-			parent := &it.stack[len(it.stack)-2]
-			if parent.Index == 0 {
-				parent.Node.(*InternalNode).left = it.current
+			if m < n.prefix.n {
+				// Subtree sorts strictly below start: nothing here.
+				it.pop()
+				if len(it.stack) == 0 {
+					it.err = errIteratorEnd
+					return
+				}
+				continue
+			}
+			if 8*len(start) <= split {
+				it.push(n, st.walk, split, 0)
+				continue
+			}
+			if bitAt(start, split) == 0 {
+				it.push(n, st.walk, split, 0)
 			} else {
-				parent.Node.(*InternalNode).right = it.current
+				// Left subtree is entirely below start.
+				it.push(n, st.walk, split, 1)
 			}
+		case empty:
+			it.pop()
+			if len(it.stack) == 0 {
+				it.err = errIteratorEnd
+				return
+			}
+			return
+		default:
+			return
 		}
-		return it.Next(descend)
-	case Empty:
-		// Empty node - go back to parent and continue
-		if len(it.stack) <= 1 {
-			it.lastErr = errIteratorEnd
-			return false
-		}
-		it.stack = it.stack[:len(it.stack)-1]
-		it.current = it.stack[len(it.stack)-1].Node
-		it.stack[len(it.stack)-1].Index++
-		return it.Next(descend)
-	default:
-		panic("invalid node type")
 	}
 }
 
-// Error returns the error status of the iterator.
-func (it *binaryNodeIterator) Error() error {
-	if it.lastErr == errIteratorEnd {
+func (it *nodeIterator) push(n *branchNode, walk bitstr, split int, side byte) {
+	child := n.left
+	if side == 1 {
+		child = n.right
+	}
+	it.stack = append(it.stack, &iterState{
+		node:   child,
+		walk:   walk.append(n.prefix).concat(side, bitstr{}),
+		pos:    split + 1,
+		valIdx: -1,
+	})
+	// Remember which side we descended, so backtracking knows whether the
+	// right side is still pending.
+	it.stack[len(it.stack)-2].valIdx = int(side)
+}
+
+func (it *nodeIterator) pop() {
+	it.stack = it.stack[:len(it.stack)-1]
+}
+
+// Next moves the iterator to the next node or leaf. If descend is false,
+// the current subtree is skipped.
+func (it *nodeIterator) Next(descend bool) bool {
+	if it.err != nil {
+		return false
+	}
+	if !descend && len(it.stack) > 0 {
+		// Skip the current subtree: drop the frame outright.
+		it.pop()
+		if len(it.stack) == 0 {
+			it.err = errIteratorEnd
+			return false
+		}
+	}
+	for {
+		if len(it.stack) == 0 {
+			it.err = errIteratorEnd
+			return false
+		}
+		st := it.stack[len(it.stack)-1]
+		switch n := st.node.(type) {
+		case empty:
+			it.pop()
+		case hashedNode:
+			resolved, err := it.trie.resolve(n, st.walk)
+			if err != nil {
+				it.err = err
+				return false
+			}
+			st.node = resolved
+		case *groupNode:
+			if !st.visited {
+				st.visited = true
+				st.valIdx = -1
+				return true // surface the group record itself
+			}
+			st.valIdx++
+			if st.valIdx < len(n.subs) {
+				return true // surface one leaf
+			}
+			it.pop()
+		case *branchNode:
+			if !st.visited {
+				st.visited = true
+				st.valIdx = -1
+				return true // surface the branch itself
+			}
+			split := st.pos + n.prefix.n
+			switch st.valIdx {
+			case -1:
+				it.push(n, st.walk, split, 0)
+			case 0:
+				it.push(n, st.walk, split, 1)
+			default:
+				it.pop()
+			}
+		default:
+			it.err = errors.New("bintrie: unknown node in iterator")
+			return false
+		}
+	}
+}
+
+func (it *nodeIterator) Error() error {
+	if it.err == errIteratorEnd {
 		return nil
 	}
-	return it.lastErr
+	return it.err
+}
+
+func (it *nodeIterator) current() (*iterState, binaryNode) {
+	if len(it.stack) == 0 {
+		return nil, nil
+	}
+	st := it.stack[len(it.stack)-1]
+	return st, st.node
 }
 
 // Hash returns the hash of the current node.
-func (it *binaryNodeIterator) Hash() common.Hash {
-	return it.current.Hash()
-}
-
-// Parent returns the hash of the parent of the current node. The hash may be the one
-// grandparent if the immediate parent is an internal node with no hash.
-func (it *binaryNodeIterator) Parent() common.Hash {
-	return it.stack[len(it.stack)-1].Node.Hash()
-}
-
-// Path returns the hex-encoded path to the current node.
-// Callers must not retain references to the return value after calling Next.
-// For leaf nodes, the last element of the path is the 'terminator symbol' 0x10.
-func (it *binaryNodeIterator) Path() []byte {
-	if it.Leaf() {
-		return it.LeafKey()
+func (it *nodeIterator) Hash() common.Hash {
+	st, n := it.current()
+	if n == nil {
+		return common.Hash{}
 	}
-	var path []byte
-	for i, state := range it.stack {
-		// skip the last byte
-		if i >= len(it.stack)-1 {
-			break
-		}
-		path = append(path, byte(state.Index))
+	return n.hashAt(st.pos)
+}
+
+// Parent returns the hash of the parent node.
+func (it *nodeIterator) Parent() common.Hash {
+	if len(it.stack) < 2 {
+		return common.Hash{}
 	}
-	return path
+	st := it.stack[len(it.stack)-2]
+	return st.node.hashAt(st.pos)
 }
 
-// NodeBlob returns the serialized bytes of the current node.
-func (it *binaryNodeIterator) NodeBlob() []byte {
-	return SerializeNode(it.current)
+// Path returns the database path of the current node, or the full key when
+// positioned on a leaf.
+func (it *nodeIterator) Path() []byte {
+	st, n := it.current()
+	if n == nil {
+		return nil
+	}
+	if g, ok := n.(*groupNode); ok && st.valIdx >= 0 && st.valIdx < len(g.subs) {
+		return append(append([]byte{}, g.stem...), g.subs[st.valIdx])
+	}
+	return pathOf(st.walk)
 }
 
-// Leaf returns true iff the current node is a leaf node.
-// In a Binary Trie, a StemNode contains up to 256 leaf values.
-// The iterator is only considered to be "at a leaf" when it's positioned
-// at a specific non-nil value within the StemNode, not just at the StemNode itself.
-func (it *binaryNodeIterator) Leaf() bool {
-	sn, ok := it.current.(*StemNode)
-	if !ok {
+// NodeBlob returns the database record of the current node.
+func (it *nodeIterator) NodeBlob() []byte {
+	st, n := it.current()
+	if n == nil {
+		return nil
+	}
+	switch n.(type) {
+	case *groupNode, *branchNode:
+		return serializeNode(n, st.pos)
+	}
+	return nil
+}
+
+// Leaf reports whether the iterator is positioned on a leaf.
+func (it *nodeIterator) Leaf() bool {
+	st, n := it.current()
+	if n == nil {
 		return false
 	}
-
-	// Check if we have a valid stack position
-	if len(it.stack) == 0 {
-		return false
-	}
-
-	// The Index in the stack state points to the NEXT position after the current value.
-	// So if Index is 0, we haven't started iterating through the values yet.
-	// If Index is 5, we're currently at value[4] (the 5th value, 0-indexed).
-	idx := it.stack[len(it.stack)-1].Index
-	if idx == 0 || idx > 256 {
-		return false
-	}
-
-	// Check if there's actually a value at the current position
-	currentValueIndex := idx - 1
-	return sn.Values[currentValueIndex] != nil
+	g, ok := n.(*groupNode)
+	return ok && st.valIdx >= 0 && st.valIdx < len(g.subs)
 }
 
-// LeafKey returns the key of the leaf. The method panics if the iterator is not
-// positioned at a leaf. Callers must not retain references to the value after
-// calling Next.
-func (it *binaryNodeIterator) LeafKey() []byte {
-	leaf, ok := it.current.(*StemNode)
-	if !ok {
-		panic("Leaf() called on an binary node iterator not at a leaf location")
+// LeafKey returns the full key of the current leaf.
+func (it *nodeIterator) LeafKey() []byte {
+	st, n := it.current()
+	if g, ok := n.(*groupNode); ok && st.valIdx >= 0 && st.valIdx < len(g.subs) {
+		return append(append([]byte{}, g.stem...), g.subs[st.valIdx])
 	}
-	return leaf.Key(it.stack[len(it.stack)-1].Index - 1)
+	panic("not at leaf")
 }
 
-// LeafBlob returns the content of the leaf. The method panics if the iterator
-// is not positioned at a leaf. Callers must not retain references to the value
-// after calling Next.
-func (it *binaryNodeIterator) LeafBlob() []byte {
-	leaf, ok := it.current.(*StemNode)
-	if !ok {
-		panic("LeafBlob() called on an binary node iterator not at a leaf location")
+// LeafBlob returns the value of the current leaf.
+func (it *nodeIterator) LeafBlob() []byte {
+	st, n := it.current()
+	if g, ok := n.(*groupNode); ok && st.valIdx >= 0 && st.valIdx < len(g.subs) {
+		return g.vals[st.valIdx]
 	}
-	return leaf.Values[it.stack[len(it.stack)-1].Index-1]
+	panic("not at leaf")
 }
 
-// LeafProof returns the Merkle proof of the leaf. The method panics if the
-// iterator is not positioned at a leaf. Callers must not retain references
-// to the value after calling Next.
-func (it *binaryNodeIterator) LeafProof() [][]byte {
-	sn, ok := it.current.(*StemNode)
-	if !ok {
-		panic("LeafProof() called on an binary node iterator not at a leaf location")
+// LeafProof returns the merkle proof of the current leaf: the hash
+// preimages of every canonical node from the root to the leaf.
+func (it *nodeIterator) LeafProof() [][]byte {
+	st, n := it.current()
+	g, ok := n.(*groupNode)
+	if !ok || st.valIdx < 0 || st.valIdx >= len(g.subs) {
+		panic("not at leaf")
 	}
-
-	proof := make([][]byte, 0, len(it.stack)+StemNodeWidth)
-
-	// Build proof by walking up the stack and collecting sibling hashes
-	for i := range it.stack[:len(it.stack)-2] {
-		state := it.stack[i]
-		internalNode := state.Node.(*InternalNode) // should panic if the node isn't an InternalNode
-
-		// Add the sibling hash to the proof
-		if state.Index == 0 {
-			// We came from left, so include right sibling
-			proof = append(proof, internalNode.right.Hash().Bytes())
-		} else {
-			// We came from right, so include left sibling
-			proof = append(proof, internalNode.left.Hash().Bytes())
-		}
+	key := append(append([]byte{}, g.stem...), g.subs[st.valIdx])
+	collector := &proofList{}
+	if err := it.trie.prove(key, collector); err != nil {
+		return nil
 	}
-
-	// Add the stem and siblings
-	proof = append(proof, sn.Stem)
-	for _, v := range sn.Values {
-		proof = append(proof, v)
-	}
-
-	return proof
+	return collector.list
 }
 
-// AddResolver sets an intermediate database to use for looking up trie nodes
-// before reaching into the real persistent layer.
-//
-// This is not required for normal operation, rather is an optimization for
-// cases where trie nodes can be recovered from some external mechanism without
-// reading from disk. In those cases, this resolver allows short circuiting
-// accesses and returning them from memory.
-//
-// Before adding a similar mechanism to any other place in Geth, consider
-// making trie.Database an interface and wrapping at that level. It's a huge
-// refactor, but it could be worth it if another occurrence arises.
-func (it *binaryNodeIterator) AddResolver(trie.NodeResolver) {
-	// Not implemented, but should not panic
-}
+// AddResolver is accepted for interface compatibility; the trie's own
+// database reader performs resolution.
+func (it *nodeIterator) AddResolver(trie.NodeResolver) {}
