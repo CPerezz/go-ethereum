@@ -175,7 +175,7 @@ func gasCodeCopyEip4762(evm *EVM, contract *Contract, stack *Stack, mem *Memory,
 		}
 
 		_, copyOffset, nonPaddedCopyLength := getDataAndAdjustedBounds(contract.Code, uint64CodeOffset, length.Uint64())
-		_, wanted := evm.AccessEvents.CodeChunksRangeGas(contract.Address(), copyOffset, nonPaddedCopyLength, uint64(len(contract.Code)), false, contract.Gas-gas)
+		_, wanted := evm.AccessEvents.CodeChunksRangeGas(contract.Address(), contract.CodeHash, copyOffset, nonPaddedCopyLength, uint64(len(contract.Code)), false, contract.Gas-gas)
 		gas += wanted
 	}
 	return gas, nil

@@ -308,7 +308,11 @@ func TestPBTGenesisCommit(t *testing.T) {
 		},
 	}
 
-	expected := common.FromHex("1fd154971d9a386c4ec75fe7138c17efb569bfc2962e46e94a376ba997e3fadc")
+	// Blessed against the EELS reference (execution-specs branch
+	// eip-8297-tests @ec412acfd): embed_flat_state of this exact alloc under
+	// the EIP-8297 embedding. Regenerate with any EELS checkout if the
+	// embedding or the tree hash changes.
+	expected := common.FromHex("4aa2bd4c47ed50e89186aa308cceb67d985fd69e55d87580111ef355cb0e3814")
 	got := genesis.ToBlock().Root().Bytes()
 	if !bytes.Equal(got, expected) {
 		t.Fatalf("invalid genesis state root, expected %x, got %x", expected, got)

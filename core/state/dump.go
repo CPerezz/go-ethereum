@@ -223,8 +223,10 @@ func (s *StateDB) DumpToCollector(c DumpCollector, conf *DumpConfig) (nextKey []
 	return nextKey
 }
 
-// DumpBinTrieLeaves collects all binary trie leaf nodes into the provided map.
-func (s *StateDB) DumpBinTrieLeaves(collector map[common.Hash]hexutil.Bytes) error {
+// DumpPBTLeaves collects all binary trie leaves into the provided map, keyed
+// by the hex encoding of the full variable-length tree key (34 or 66 bytes;
+// a fixed-width hash key would silently alias them).
+func (s *StateDB) DumpPBTLeaves(collector map[string]hexutil.Bytes) error {
 	tr, err := s.db.OpenTrie(s.originalRoot)
 	if err != nil {
 		return err
@@ -239,7 +241,7 @@ func (s *StateDB) DumpBinTrieLeaves(collector map[common.Hash]hexutil.Bytes) err
 	}
 	for it.Next(true) {
 		if it.Leaf() {
-			collector[common.BytesToHash(it.LeafKey())] = it.LeafBlob()
+			collector[hexutil.Encode(it.LeafKey())] = it.LeafBlob()
 		}
 	}
 	return nil

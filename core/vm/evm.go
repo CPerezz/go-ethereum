@@ -613,7 +613,7 @@ func (evm *EVM) initNewContract(contract *Contract, address common.Address) ([]b
 			return ret, ErrCodeStoreOutOfGas
 		}
 	} else {
-		consumed, wanted := evm.AccessEvents.CodeChunksRangeGas(address, 0, uint64(len(ret)), uint64(len(ret)), true, contract.Gas)
+		consumed, wanted := evm.AccessEvents.CodeChunksRangeGas(address, crypto.Keccak256Hash(ret), 0, uint64(len(ret)), uint64(len(ret)), true, contract.Gas)
 		contract.UseGas(consumed, evm.Config.Tracer, tracing.GasChangeWitnessCodeChunk)
 		if len(ret) > 0 && (consumed < wanted) {
 			return ret, ErrCodeStoreOutOfGas

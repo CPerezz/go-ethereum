@@ -22,13 +22,11 @@ import (
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/overlay"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
-	"github.com/ethereum/go-ethereum/trie/transitiontrie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/database"
 )
@@ -175,38 +173,7 @@ func newTrieReader(root common.Hash, db *triedb.Database) (*trieReader, error) {
 	if !db.IsPBT() {
 		tr, err = trie.NewStateTrie(trie.StateTrieID(root), db)
 	} else {
-		// When IsPBT() is true, create a BinaryTrie wrapped in TransitionTrie
-		binTrie, binErr := bintrie.NewBinaryTrie(root, db)
-		if binErr != nil {
-			return nil, binErr
-		}
-
-		// Based on the transition status, determine if the overlay
-		// tree needs to be created, or if a single, target tree is
-		// to be picked.
-		ts := overlay.LoadTransitionState(db.Disk(), root, true)
-		if ts.InTransition() {
-			mpt, err := trie.NewStateTrie(trie.StateTrieID(ts.BaseRoot), db)
-			if err != nil {
-				return nil, err
-			}
-			tr = transitiontrie.NewTransitionTrie(mpt, binTrie, false)
-		} else {
-			// HACK: Use TransitionTrie with nil base as a wrapper to make BinaryTrie
-			// satisfy the Trie interface. This works around the import cycle between
-			// trie and trie/bintrie packages.
-			//
-			// TODO: In future PRs, refactor the package structure to avoid this hack:
-			// - Option 1: Move common interfaces (Trie, NodeIterator) to a separate
-			//   package that both trie and trie/bintrie can import
-			// - Option 2: Create a factory function in the trie package that returns
-			//   BinaryTrie as a Trie interface without direct import
-			// - Option 3: Move BinaryTrie to the main trie package
-			//
-			// The current approach works but adds unnecessary overhead and complexity
-			// by using TransitionTrie when there's no actual transition happening.
-			tr = transitiontrie.NewTransitionTrie(nil, binTrie, false)
-		}
+		tr, err = bintrie.NewBinaryTrie(root, db)
 	}
 	if err != nil {
 		return nil, err
