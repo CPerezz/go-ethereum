@@ -737,7 +737,7 @@ var Forks = map[string]*params.ChainConfig{
 		MergeNetsplitBlock:      big.NewInt(0),
 		TerminalTotalDifficulty: big.NewInt(0),
 		ShanghaiTime:            u64(0),
-		VerkleTime:              u64(0),
+		PBTTime:                 u64(0),
 	},
 }
 

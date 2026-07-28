@@ -126,10 +126,10 @@ func (t *BlockTest) Run(snapshotter bool, scheme string, witness bool, tracer *t
 		db    = rawdb.NewMemoryDatabase()
 		tconf = &triedb.Config{
 			Preimages: true,
-			IsVerkle:  gspec.Config.VerkleTime != nil && *gspec.Config.VerkleTime <= gspec.Timestamp,
+			IsPBT:     gspec.Config.PBTTime != nil && *gspec.Config.PBTTime <= gspec.Timestamp,
 		}
 	)
-	if scheme == rawdb.PathScheme || tconf.IsVerkle {
+	if scheme == rawdb.PathScheme || tconf.IsPBT {
 		tconf.PathDB = pathdb.Defaults
 	} else {
 		tconf.HashDB = hashdb.Defaults

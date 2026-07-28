@@ -258,10 +258,10 @@ func (cfg BlockChainConfig) WithNoAsyncFlush(on bool) *BlockChainConfig {
 }
 
 // triedbConfig derives the configures for trie database.
-func (cfg *BlockChainConfig) triedbConfig(isVerkle bool) *triedb.Config {
+func (cfg *BlockChainConfig) triedbConfig(isPBT bool) *triedb.Config {
 	config := &triedb.Config{
 		Preimages: cfg.Preimages,
-		IsVerkle:  isVerkle,
+		IsPBT:     isPBT,
 	}
 	if cfg.StateScheme == rawdb.HashScheme {
 		config.HashDB = &hashdb.Config{
@@ -378,11 +378,11 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	}
 
 	// Open trie database with provided config
-	enableVerkle, err := EnableVerkleAtGenesis(db, genesis)
+	enablePBT, err := EnablePBTAtGenesis(db, genesis)
 	if err != nil {
 		return nil, err
 	}
-	triedb := triedb.NewDatabase(db, cfg.triedbConfig(enableVerkle))
+	triedb := triedb.NewDatabase(db, cfg.triedbConfig(enablePBT))
 
 	// Write the supplied genesis to the database if it has not been initialized
 	// yet. The corresponding chain config will be returned, either from the

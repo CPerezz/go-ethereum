@@ -261,8 +261,8 @@ func newDbConfig(scheme string) *triedb.Config {
 	return &triedb.Config{PathDB: &config}
 }
 
-func TestVerkleGenesisCommit(t *testing.T) {
-	var verkleTime uint64 = 0
+func TestPBTGenesisCommit(t *testing.T) {
+	var pbtTime uint64 = 0
 	verkleConfig := &params.ChainConfig{
 		ChainID:                 big.NewInt(1),
 		HomesteadBlock:          big.NewInt(0),
@@ -281,13 +281,13 @@ func TestVerkleGenesisCommit(t *testing.T) {
 		ArrowGlacierBlock:       big.NewInt(0),
 		GrayGlacierBlock:        big.NewInt(0),
 		MergeNetsplitBlock:      nil,
-		ShanghaiTime:            &verkleTime,
-		CancunTime:              &verkleTime,
-		PragueTime:              &verkleTime,
-		OsakaTime:               &verkleTime,
-		VerkleTime:              &verkleTime,
+		ShanghaiTime:            &pbtTime,
+		CancunTime:              &pbtTime,
+		PragueTime:              &pbtTime,
+		OsakaTime:               &pbtTime,
+		PBTTime:                 &pbtTime,
 		TerminalTotalDifficulty: big.NewInt(0),
-		EnableVerkleAtGenesis:   true,
+		EnablePBTAtGenesis:      true,
 		Ethash:                  nil,
 		Clique:                  nil,
 		BlobScheduleConfig: &params.BlobScheduleConfig{
@@ -301,7 +301,7 @@ func TestVerkleGenesisCommit(t *testing.T) {
 	genesis := &Genesis{
 		BaseFee:    big.NewInt(params.InitialBaseFee),
 		Config:     verkleConfig,
-		Timestamp:  verkleTime,
+		Timestamp:  pbtTime,
 		Difficulty: big.NewInt(0),
 		Alloc: types.GenesisAlloc{
 			{1}: {Balance: big.NewInt(1), Storage: map[common.Hash]common.Hash{{1}: {1}}},
@@ -320,8 +320,8 @@ func TestVerkleGenesisCommit(t *testing.T) {
 	config.NoAsyncFlush = true
 
 	triedb := triedb.NewDatabase(db, &triedb.Config{
-		IsVerkle: true,
-		PathDB:   &config,
+		IsPBT:  true,
+		PathDB: &config,
 	})
 	block := genesis.MustCommit(db, triedb)
 	if !bytes.Equal(block.Root().Bytes(), expected) {
@@ -329,10 +329,10 @@ func TestVerkleGenesisCommit(t *testing.T) {
 	}
 
 	// Test that the trie is verkle
-	if !triedb.IsVerkle() {
+	if !triedb.IsPBT() {
 		t.Fatalf("expected trie to be verkle")
 	}
-	vdb := rawdb.NewTable(db, string(rawdb.VerklePrefix))
+	vdb := rawdb.NewTable(db, string(rawdb.PBTPrefix))
 	if !rawdb.HasAccountTrieNode(vdb, nil) {
 		t.Fatal("could not find node")
 	}

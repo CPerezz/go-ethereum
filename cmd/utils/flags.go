@@ -264,9 +264,9 @@ var (
 		Usage:    "Manually specify the bpo2 fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
-	OverrideVerkle = &cli.Uint64Flag{
-		Name:     "override.verkle",
-		Usage:    "Manually specify the Verkle fork timestamp, overriding the bundled setting",
+	OverridePBT = &cli.Uint64Flag{
+		Name:     "override.pbt",
+		Usage:    "Manually specify the PBT (binary tree) fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
 	OverrideGenesisFlag = &cli.StringFlag{
@@ -2440,7 +2440,7 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 		// Enables file journaling for the trie database. The journal files will be stored
 		// within the data directory. The corresponding paths will be either:
 		// - DATADIR/triedb/merkle.journal
-		// - DATADIR/triedb/verkle.journal
+		// - DATADIR/triedb/pbt.journal
 		TrieJournalDirectory: stack.ResolvePath("triedb"),
 
 		// Enable state size tracking if enabled
@@ -2516,10 +2516,10 @@ func MakeConsolePreloads(ctx *cli.Context) []string {
 }
 
 // MakeTrieDatabase constructs a trie database based on the configured scheme.
-func MakeTrieDatabase(ctx *cli.Context, stack *node.Node, disk ethdb.Database, preimage bool, readOnly bool, isVerkle bool) *triedb.Database {
+func MakeTrieDatabase(ctx *cli.Context, stack *node.Node, disk ethdb.Database, preimage bool, readOnly bool, isPBT bool) *triedb.Database {
 	config := &triedb.Config{
 		Preimages: preimage,
-		IsVerkle:  isVerkle,
+		IsPBT:     isPBT,
 	}
 	scheme, err := rawdb.ParseStateScheme(ctx.String(StateSchemeFlag.Name), disk)
 	if err != nil {

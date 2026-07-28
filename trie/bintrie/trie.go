@@ -361,8 +361,8 @@ func (t *BinaryTrie) Copy() *BinaryTrie {
 	}
 }
 
-// IsVerkle returns true if the trie is a Verkle tree.
-func (t *BinaryTrie) IsVerkle() bool {
+// IsPBT returns true if the trie is a Verkle tree.
+func (t *BinaryTrie) IsPBT() bool {
 	// TODO @gballet This is technically NOT a verkle tree, but it has the same
 	// behavior and basic structure, so for all intents and purposes, it can be
 	// treated as such. Rename this when verkle gets removed.

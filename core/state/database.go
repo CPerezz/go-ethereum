@@ -138,8 +138,8 @@ type Trie interface {
 	// with the node that proves the absence of the key.
 	Prove(key []byte, proofDb ethdb.KeyValueWriter) error
 
-	// IsVerkle returns true if the trie is verkle-tree based
-	IsVerkle() bool
+	// IsPBT returns true if the trie is verkle-tree based
+	IsPBT() bool
 }
 
 // CachingDB is an implementation of Database interface. It leverages both trie and
@@ -236,14 +236,14 @@ func (db *CachingDB) ReadersWithCacheStats(stateRoot common.Hash) (Reader, Reade
 
 // OpenTrie opens the main account trie at a specific root hash.
 func (db *CachingDB) OpenTrie(root common.Hash) (Trie, error) {
-	if db.triedb.IsVerkle() {
-		ts := overlay.LoadTransitionState(db.TrieDB().Disk(), root, db.triedb.IsVerkle())
+	if db.triedb.IsPBT() {
+		ts := overlay.LoadTransitionState(db.TrieDB().Disk(), root, db.triedb.IsPBT())
 		if ts.InTransition() {
 			panic("state tree transition isn't supported yet")
 		}
 		if ts.Transitioned() {
-			// Use BinaryTrie instead of VerkleTrie when IsVerkle is set
-			// (IsVerkle actually means Binary Trie mode in this codebase)
+			// Use BinaryTrie instead of VerkleTrie when IsPBT is set
+			// (IsPBT actually means Binary Trie mode in this codebase)
 			return bintrie.NewBinaryTrie(root, db.triedb)
 		}
 	}
@@ -256,7 +256,7 @@ func (db *CachingDB) OpenTrie(root common.Hash) (Trie, error) {
 
 // OpenStorageTrie opens the storage trie of an account.
 func (db *CachingDB) OpenStorageTrie(stateRoot common.Hash, address common.Address, root common.Hash, self Trie) (Trie, error) {
-	if db.triedb.IsVerkle() {
+	if db.triedb.IsPBT() {
 		return self, nil
 	}
 	tr, err := trie.NewStateTrie(trie.StorageTrieID(stateRoot, crypto.Keccak256Hash(address.Bytes()), root), db.triedb)
