@@ -720,7 +720,10 @@ var Forks = map[string]*params.ChainConfig{
 			BPO4:   params.DefaultBPO4BlobConfig,
 		},
 	},
-	"Verkle": {
+	// BinaryTree activates the EIP-8297 partitioned binary tree on top of
+	// the latest scheduled fork, matching the fork name the execution
+	// specs use for it.
+	"BinaryTree": {
 		ChainID:                 big.NewInt(1),
 		HomesteadBlock:          big.NewInt(0),
 		EIP150Block:             big.NewInt(0),
@@ -737,7 +740,15 @@ var Forks = map[string]*params.ChainConfig{
 		MergeNetsplitBlock:      big.NewInt(0),
 		TerminalTotalDifficulty: big.NewInt(0),
 		ShanghaiTime:            u64(0),
+		CancunTime:              u64(0),
+		PragueTime:              u64(0),
+		OsakaTime:               u64(0),
 		PBTTime:                 u64(0),
+		BlobScheduleConfig: &params.BlobScheduleConfig{
+			Cancun: params.DefaultCancunBlobConfig,
+			Prague: params.DefaultPragueBlobConfig,
+			Osaka:  params.DefaultOsakaBlobConfig,
+		},
 	},
 }
 
