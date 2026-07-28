@@ -232,7 +232,11 @@ func TestProcessParentBlockHash(t *testing.T) {
 		db := rawdb.NewMemoryDatabase()
 		cacheConfig := DefaultConfig().WithStateScheme(rawdb.PathScheme)
 		cacheConfig.SnapshotLimit = 0
-		triedb := triedb.NewDatabase(db, cacheConfig.triedbConfig(true))
+		tdbConfig, err := cacheConfig.triedbConfig(true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		triedb := triedb.NewDatabase(db, tdbConfig)
 		statedb, _ := state.New(types.EmptyBinaryHash, state.NewDatabase(triedb, nil))
 		checkBlockHashes(statedb, true)
 	})

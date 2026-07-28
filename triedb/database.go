@@ -32,7 +32,7 @@ import (
 // Config defines all necessary options for database.
 type Config struct {
 	Preimages bool           // Flag whether the preimage of node key is recorded
-	IsPBT     bool           // Flag whether the db is holding a verkle tree
+	IsPBT     bool           // Flag whether the db is holding a binary tree
 	HashDB    *hashdb.Config // Configs for hash-based scheme
 	PathDB    *pathdb.Config // Configs for experimental path-based scheme
 }
@@ -45,7 +45,7 @@ var HashDefaults = &Config{
 	HashDB:    hashdb.Defaults,
 }
 
-// PBTDefaults represents a config for holding verkle trie data
+// PBTDefaults represents a config for holding binary trie data
 // using path-based scheme with default settings.
 var PBTDefaults = &Config{
 	Preimages: false,
@@ -375,7 +375,7 @@ func (db *Database) IndexProgress() (uint64, error) {
 	return pdb.IndexProgress()
 }
 
-// IsPBT returns the indicator if the database is holding a verkle tree.
+// IsPBT returns the indicator if the database is holding a binary tree.
 func (db *Database) IsPBT() bool {
 	return db.config.IsPBT
 }
