@@ -97,7 +97,7 @@ func newLookup(head layer, descendant func(state common.Hash, ancestor common.Ha
 // (a) the account remains unmodified from the current disk layer up to the state
 // layer specified by the stateID: fallback to the disk layer for data retrieval,
 // (b) or the layer specified by the stateID is stale: reject the data retrieval.
-func (l *lookup) accountTip(accountHash common.Hash, stateID common.Hash, base common.Hash) common.Hash {
+func (l *lookup) accountTip(accountHash common.Hash, stateID common.Hash, base common.Hash) (common.Hash, bool) {
 	// Traverse the mutation history from latest to oldest one. Several
 	// scenarios are possible:
 	//
@@ -123,17 +123,21 @@ func (l *lookup) accountTip(accountHash common.Hash, stateID common.Hash, base c
 		// containing the modified data. Otherwise, the current state may be ahead
 		// of the requested one or belong to a different branch.
 		if list[i] == stateID || l.descendant(stateID, list[i]) {
-			return list[i]
+			return list[i], true
 		}
 	}
 	// No layer matching the stateID or its descendants was found. Use the
 	// current disk layer as a fallback.
 	if base == stateID || l.descendant(stateID, base) {
-		return base
+		return base, true
 	}
 	// The layer associated with 'stateID' is not the descendant of the current
-	// disk layer, it's already stale, return nothing.
-	return common.Hash{}
+	// disk layer, it's already stale.
+	//
+	// Reported separately rather than as a zero hash: the binary tree's empty
+	// root is the zero hash, so a successful lookup of an empty disk layer
+	// would otherwise be indistinguishable from this failure.
+	return common.Hash{}, false
 }
 
 // storageTip traverses the layer list associated with the given account and
@@ -147,7 +151,7 @@ func (l *lookup) accountTip(accountHash common.Hash, stateID common.Hash, base c
 // the state layer specified by the stateID: fallback to the disk layer for
 // data retrieval, (b) or the layer specified by the stateID is stale: reject
 // the data retrieval.
-func (l *lookup) storageTip(accountHash common.Hash, slotHash common.Hash, stateID common.Hash, base common.Hash) common.Hash {
+func (l *lookup) storageTip(accountHash common.Hash, slotHash common.Hash, stateID common.Hash, base common.Hash) (common.Hash, bool) {
 	list := l.storages[storageKey(accountHash, slotHash)]
 	for i := len(list) - 1; i >= 0; i-- {
 		// If the current state matches the stateID, or the requested state is a
@@ -155,17 +159,21 @@ func (l *lookup) storageTip(accountHash common.Hash, slotHash common.Hash, state
 		// containing the modified data. Otherwise, the current state may be ahead
 		// of the requested one or belong to a different branch.
 		if list[i] == stateID || l.descendant(stateID, list[i]) {
-			return list[i]
+			return list[i], true
 		}
 	}
 	// No layer matching the stateID or its descendants was found. Use the
 	// current disk layer as a fallback.
 	if base == stateID || l.descendant(stateID, base) {
-		return base
+		return base, true
 	}
 	// The layer associated with 'stateID' is not the descendant of the current
-	// disk layer, it's already stale, return nothing.
-	return common.Hash{}
+	// disk layer, it's already stale.
+	//
+	// Reported separately rather than as a zero hash: the binary tree's empty
+	// root is the zero hash, so a successful lookup of an empty disk layer
+	// would otherwise be indistinguishable from this failure.
+	return common.Hash{}, false
 }
 
 // addLayer traverses the state data retained in the specified diff layer and
