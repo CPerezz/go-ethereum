@@ -974,7 +974,10 @@ func (bc *BlockChain) rewindPathHead(head *types.Header, root common.Hash) (*typ
 			return head, rootNumber
 		}
 	}
-	// Recover if the target state if it's not available yet.
+	// Recover if the target state if it's not available yet. Merkle only in
+	// practice: the loop above breaks on HasState or stateRecoverable, and the
+	// binary tree always reports the latter false, so it can only get here with
+	// live state already in hand.
 	if !bc.HasState(head.Root) {
 		if err := bc.triedb.Recover(head.Root); err != nil {
 			log.Error("Failed to rollback state, resetting to genesis", "err", err)
