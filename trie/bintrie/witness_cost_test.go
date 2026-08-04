@@ -322,6 +322,305 @@ func TestCodeWitnessPartialRead(t *testing.T) {
 	}
 }
 
+// TestAccountReadShipsCode measures the coupling between an account's code and
+// its other fields: chunks 0..127 live in the account's own header stem, so any
+// format that ships whole stem records ships the code along with the balance.
+//
+// This is what decides whether the cheap record format is cheap in practice. A
+// transaction that only moves value touches BASIC_DATA, nothing else.
+func TestAccountReadShipsCode(t *testing.T) {
+	t.Log("cost of reading BASIC_DATA alone, by how much code the account holds")
+	t.Log("  code B | path-proof B | record B")
+	for _, codeLen := range []int{0, 31, 3968, 24576} {
+		disk := rawdb.NewMemoryDatabase()
+		db := triedb.NewDatabase(disk, triedb.PBTDefaults)
+
+		var (
+			target   = common.Address{0xc0, 0xde, 0x01}
+			code     = distinctCode(0xc0, codeLen)
+			codeHash = crypto.Keccak256Hash(code)
+		)
+		tr := openTrie(t, db, types.EmptyBinaryHash)
+		for i := 0; i < 64; i++ {
+			var addr common.Address
+			addr[0], addr[1], addr[2] = byte(i), byte(i>>8), byte(i>>16)
+			if err := tr.UpdateAccount(addr, testAccount(uint64(i+1)), 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		acct := testAccount(1)
+		if codeLen > 0 {
+			acct.CodeHash = codeHash[:]
+		}
+		if err := tr.UpdateAccount(target, acct, codeLen); err != nil {
+			t.Fatal(err)
+		}
+		if codeLen > 0 {
+			if err := tr.UpdateContractCode(target, codeHash, code); err != nil {
+				t.Fatal(err)
+			}
+		}
+		root := commitTrie(t, db, tr, types.EmptyBinaryHash, 1)
+
+		key := bintrie.BasicDataKey(target)
+
+		proofDb := memorydb.New()
+		p := openTrie(t, db, root)
+		if err := p.Prove(key, proofDb); err != nil {
+			t.Fatal(err)
+		}
+		pb := 0
+		it := proofDb.NewIterator(nil, nil)
+		for it.Next() {
+			pb += len(it.Value())
+		}
+		it.Release()
+
+		r := openTrie(t, db, root)
+		if _, err := r.GetStemValue(key); err != nil {
+			t.Fatal(err)
+		}
+		rb := 0
+		for _, blob := range r.Witness() {
+			rb += len(blob)
+		}
+		t.Log(fmt.Sprintf("%8d | %12d | %8d", codeLen, pb, rb))
+		db.Close()
+	}
+}
+
+// TestCodeWitnessByRegion splits a max-size contract's witness cost between the
+// two places its code lives: the 128 chunks inside the account header stem, and
+// the rest in content-addressed code-zone stems.
+//
+// The two regions are not equivalent per byte. The header's 128 chunks sit in
+// one stem alongside BASIC_DATA and CODE_HASH; the remaining 665 span three
+// code-zone stems, each needing its own path from the root. Measuring them
+// apart shows which half the cost actually comes from.
+func TestCodeWitnessByRegion(t *testing.T) {
+	const codeLen = 24576
+
+	disk := rawdb.NewMemoryDatabase()
+	db := triedb.NewDatabase(disk, triedb.PBTDefaults)
+	defer db.Close()
+
+	var (
+		target   = common.Address{0xc0, 0xde, 0x01}
+		code     = distinctCode(0xc0, codeLen)
+		codeHash = crypto.Keccak256Hash(code)
+	)
+	tr := openTrie(t, db, types.EmptyBinaryHash)
+	for i := 0; i < 64; i++ {
+		var addr common.Address
+		addr[0], addr[1], addr[2] = byte(i), byte(i>>8), byte(i>>16)
+		if err := tr.UpdateAccount(addr, testAccount(uint64(i+1)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	acct := testAccount(1)
+	acct.CodeHash = codeHash[:]
+	if err := tr.UpdateAccount(target, acct, len(code)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.UpdateContractCode(target, codeHash, code); err != nil {
+		t.Fatal(err)
+	}
+	root := commitTrie(t, db, tr, types.EmptyBinaryHash, 1)
+
+	// measure proves and reads the chunks in [lo, hi) and returns both formats.
+	measure := func(lo, hi int) (proofB, proofN, recordB, recordN int) {
+		proofDb := memorydb.New()
+		p := openTrie(t, db, root)
+		for i := lo; i < hi; i++ {
+			if err := p.Prove(bintrie.CodeChunkKey(target, codeHash, uint64(i)), proofDb); err != nil {
+				t.Fatal(err)
+			}
+		}
+		it := proofDb.NewIterator(nil, nil)
+		for it.Next() {
+			proofB += len(it.Value())
+			proofN++
+		}
+		it.Release()
+
+		r := openTrie(t, db, root)
+		for i := lo; i < hi; i++ {
+			if _, err := r.GetStemValue(bintrie.CodeChunkKey(target, codeHash, uint64(i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, blob := range r.Witness() {
+			recordB += len(blob)
+			recordN++
+		}
+		return
+	}
+
+	total := (codeLen + 30) / 31
+	hdrChunks := 128
+	hdrCode := hdrChunks * 31
+	ovfCode := codeLen - hdrCode
+
+	hp, hn, hr, hrn := measure(0, hdrChunks)
+	op, on, or, orn := measure(hdrChunks, total)
+	cp, cn, cr, crn := measure(0, total)
+
+	t.Logf("24 KB contract: %d chunks total, %d in the account header stem, %d in %d code-zone stems",
+		total, hdrChunks, total-hdrChunks, (total-hdrChunks+255)/256)
+	t.Log("")
+	t.Log("region                        code B  chunks | path-proof B  nodes  B/codeB | record B  nodes  B/codeB")
+	t.Logf("account header (chunks 0-127) %6d %7d | %12d %6d %8.2f | %8d %6d %8.2f",
+		hdrCode, hdrChunks, hp, hn, float64(hp)/float64(hdrCode), hr, hrn, float64(hr)/float64(hdrCode))
+	t.Logf("code zone      (chunks 128+)  %6d %7d | %12d %6d %8.2f | %8d %6d %8.2f",
+		ovfCode, total-hdrChunks, op, on, float64(op)/float64(ovfCode), or, orn, float64(or)/float64(ovfCode))
+	t.Logf("combined                      %6d %7d | %12d %6d %8.2f | %8d %6d %8.2f",
+		codeLen, total, cp, cn, float64(cp)/float64(codeLen), cr, crn, float64(cr)/float64(codeLen))
+	t.Logf("shared between the two (double-counted if summed): path-proof %d B, record %d B",
+		hp+op-cp, hr+or-cr)
+}
+
+// TestProofNodeComposition splits a full-code path proof into the leaves that
+// carry payload and the internal branches that do not.
+//
+// It matters because a proof that ships every leaf of a subtree does not need
+// that subtree's internal branches at all - a verifier holding all the children
+// recomputes them. Whatever share the branches hold is therefore the share a
+// proper multiproof encoding would remove for free.
+func TestProofNodeComposition(t *testing.T) {
+	const codeLen = 24576
+
+	disk := rawdb.NewMemoryDatabase()
+	db := triedb.NewDatabase(disk, triedb.PBTDefaults)
+	defer db.Close()
+
+	var (
+		target   = common.Address{0xc0, 0xde, 0x01}
+		code     = distinctCode(0xc0, codeLen)
+		codeHash = crypto.Keccak256Hash(code)
+	)
+	tr := openTrie(t, db, types.EmptyBinaryHash)
+	for i := 0; i < 64; i++ {
+		var addr common.Address
+		addr[0], addr[1], addr[2] = byte(i), byte(i>>8), byte(i>>16)
+		if err := tr.UpdateAccount(addr, testAccount(uint64(i+1)), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	acct := testAccount(1)
+	acct.CodeHash = codeHash[:]
+	if err := tr.UpdateAccount(target, acct, len(code)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.UpdateContractCode(target, codeHash, code); err != nil {
+		t.Fatal(err)
+	}
+	root := commitTrie(t, db, tr, types.EmptyBinaryHash, 1)
+
+	proofDb := memorydb.New()
+	p := openTrie(t, db, root)
+	total := (codeLen + 30) / 31
+	for i := 0; i < total; i++ {
+		if err := p.Prove(bintrie.CodeChunkKey(target, codeHash, uint64(i)), proofDb); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var leafB, leafN, branchB, branchN int
+	it := proofDb.NewIterator(nil, nil)
+	for it.Next() {
+		v := it.Value()
+		switch v[0] {
+		case 0x00: // tagLeaf
+			leafB += len(v)
+			leafN++
+		case 0x01: // tagBranch
+			branchB += len(v)
+			branchN++
+		}
+	}
+	it.Release()
+	all := leafB + branchB
+
+	t.Logf("full-code path proof for a %d B contract (%d chunks)", codeLen, total)
+	t.Logf("  leaves   %7d B  %5d nodes  %5.1f%%", leafB, leafN, 100*float64(leafB)/float64(all))
+	t.Logf("  branches %7d B  %5d nodes  %5.1f%%", branchB, branchN, 100*float64(branchB)/float64(all))
+	t.Logf("  total    %7d B", all)
+	t.Logf("of the leaf bytes, %d B are the 32-byte values and %d B are keys the verifier already knows",
+		leafN*32, leafB-leafN*32)
+	t.Logf("floor if branches are recomputed and known keys dropped: %d B = %.2fx code",
+		leafN*32, float64(leafN*32)/float64(codeLen))
+}
+
+// TestDuplicateContractDedup measures the case that actually separates the two
+// zones: many accounts running identical bytecode.
+//
+// Header chunks are keyed by address, so N contracts hold N private copies.
+// Overflow chunks are keyed by code hash, so the same N contracts share one set
+// of stems. This is the difference the layout makes, and it is invisible in any
+// single-contract measurement.
+func TestDuplicateContractDedup(t *testing.T) {
+	const (
+		contracts = 50
+		codeLen   = 8000 // 259 chunks: 128 in the header, 131 in the code zone
+	)
+	disk := rawdb.NewMemoryDatabase()
+	db := triedb.NewDatabase(disk, triedb.PBTDefaults)
+	defer db.Close()
+
+	// One bytecode, deployed at many addresses - the proxy pattern.
+	code := distinctCode(0xaa, codeLen)
+	codeHash := crypto.Keccak256Hash(code)
+
+	tr := openTrie(t, db, types.EmptyBinaryHash)
+	var addrs []common.Address
+	for i := 0; i < contracts; i++ {
+		var addr common.Address
+		addr[0], addr[1] = 0xc0, byte(i)
+		addrs = append(addrs, addr)
+		acct := testAccount(uint64(i + 1))
+		acct.CodeHash = codeHash[:]
+		if err := tr.UpdateAccount(addr, acct, len(code)); err != nil {
+			t.Fatal(err)
+		}
+		if err := tr.UpdateContractCode(addr, codeHash, code); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root := commitTrie(t, db, tr, types.EmptyBinaryHash, 1)
+
+	total := (codeLen + 30) / 31
+	proveRange := func(lo, hi int) (int, int) {
+		proofDb := memorydb.New()
+		p := openTrie(t, db, root)
+		for _, addr := range addrs {
+			for i := lo; i < hi; i++ {
+				if err := p.Prove(bintrie.CodeChunkKey(addr, codeHash, uint64(i)), proofDb); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		b, n := 0, 0
+		it := proofDb.NewIterator(nil, nil)
+		for it.Next() {
+			b += len(it.Value())
+			n++
+		}
+		it.Release()
+		return b, n
+	}
+	hdrB, hdrN := proveRange(0, 128)
+	ovfB, ovfN := proveRange(128, total)
+
+	hdrCode, ovfCode := 128*31, (total-128)*31
+	t.Logf("%d accounts running identical %d B bytecode", contracts, codeLen)
+	t.Log("  region                     proof B  nodes | B per contract | B per code B")
+	t.Logf("  header chunks (per-addr)  %8d %6d | %14d | %11.2f",
+		hdrB, hdrN, hdrB/contracts, float64(hdrB)/float64(contracts*hdrCode))
+	t.Logf("  code zone (per-codehash)  %8d %6d | %14d | %11.2f",
+		ovfB, ovfN, ovfB/contracts, float64(ovfB)/float64(contracts*ovfCode))
+	t.Logf("per-code-byte, the header region costs %.1fx what the code zone does across %d duplicates",
+		(float64(hdrB)/float64(hdrCode))/(float64(ovfB)/float64(ovfCode)), contracts)
+}
+
 // TestCodeWitnessCostVsStateSize checks how much of the cost depends on the
 // size of the surrounding state, which is where a benchmark on a toy fixture
 // would flatter itself.
