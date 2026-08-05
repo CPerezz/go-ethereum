@@ -18,6 +18,7 @@ package bintrie_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -402,5 +403,97 @@ func TestMultiproofSize(t *testing.T) {
 				t.Errorf("%s: multiproof %d B is not smaller than the best existing format (%d B)", p.name, mpB, best)
 			}
 		}
+	}
+}
+
+// TestMultiproofMustCoverWholeHeaderStem pins the structural reason a
+// multiproof cannot simply replace the node-set witness.
+//
+// TestMultiproofSize reads the verified trie back with GetStemValue, the
+// key-shaped walk, which is content to find a stem only partially covered.
+// state.Trie is not: GetAccount goes through getStemGroup, which returns
+// ErrPartialStem for an expanded stem, and so do HasHeaderStorage and both
+// Prefetch methods. So a proof over exactly the keys a block read verifies
+// against the root, answers those keys, and still cannot serve the account
+// read every block performs - it has to carry every sub-index resident in the
+// stem, whatever the block actually touched.
+//
+// Deliberately no sizes here. What they cost depends on the stem layout, which
+// EIP-8297 has since changed by moving code chunks out of the account header,
+// so any figure taken now would price a shape the spec no longer has. TODO.md
+// carries the measurement as work owed once that migration lands.
+func TestMultiproofMustCoverWholeHeaderStem(t *testing.T) {
+	const codeLen = 24576
+	db, root, addr, codeHash := mpFixture(t, codeLen, 4096)
+
+	// The sparse read the original figure came from: basic data, code hash and
+	// a single code chunk.
+	sparse := [][]byte{
+		bintrie.BasicDataKey(addr),
+		bintrie.CodeHashKey(addr),
+		bintrie.CodeChunkKey(addr, codeHash, 0),
+	}
+	// Everything resident in this fixture's header stem: the two account
+	// leaves plus the 128 code chunks that currently live there rather than in
+	// the code zone. Note this is the floor, not the general figure - a
+	// contract holding any of storage slots 0..63 keeps those at sub-indices
+	// 64..127 and would need them too.
+	whole := [][]byte{bintrie.BasicDataKey(addr), bintrie.CodeHashKey(addr)}
+	for c := uint64(0); c < 128; c++ {
+		whole = append(whole, bintrie.CodeChunkKey(addr, codeHash, c))
+	}
+
+	proveAndVerify := func(keys [][]byte) *bintrie.BinaryTrie {
+		t.Helper()
+		mp, err := openTrie(t, db, root).ProveMulti(keys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := bintrie.DecodeMultiproof(mp.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		verified, err := bintrie.VerifyMultiproof(root, decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return verified
+	}
+
+	sparseTrie := proveAndVerify(sparse)
+	wholeTrie := proveAndVerify(whole)
+
+	// The sparse proof verifies against the root and answers the keys it
+	// covered, and still cannot serve the account read every block performs.
+	if _, err := sparseTrie.GetStemValue(bintrie.BasicDataKey(addr)); err != nil {
+		t.Fatalf("the sparse proof does not answer the key it covered: %v", err)
+	}
+	if _, err := sparseTrie.GetAccount(addr); !errors.Is(err, bintrie.ErrPartialStem) {
+		t.Fatalf("GetAccount over a sparse proof returned %v, want ErrPartialStem. "+
+			"Two things can cause that: the read path moved onto the key-shaped walk, or the "+
+			"stem layout changed so this key set now covers it - the code zone migration in "+
+			"TODO.md does exactly that. Check which before touching the note there", err)
+	}
+	// Covering the stem is what makes it answerable, which is the cost the
+	// format has to carry.
+	acc, err := wholeTrie.GetAccount(addr)
+	if err != nil {
+		t.Fatalf("GetAccount over a whole-stem proof failed: %v", err)
+	}
+	if acc == nil || !bytes.Equal(acc.CodeHash, codeHash[:]) {
+		t.Fatalf("whole-stem proof returned the wrong account: %+v", acc)
+	}
+	// An account with no code has only the two leaves in its stem, so there is
+	// nothing extra to cover. Whatever case a multiproof witness has lives
+	// here rather than on contracts.
+	var eoa common.Address
+	eoa[0], eoa[1], eoa[2] = 7, 0, 0 // one of mpFixture's filler accounts
+	eoaTrie := proveAndVerify([][]byte{bintrie.BasicDataKey(eoa), bintrie.CodeHashKey(eoa)})
+	eoaAcc, err := eoaTrie.GetAccount(eoa)
+	if err != nil {
+		t.Fatalf("GetAccount over a code-free account's proof failed: %v", err)
+	}
+	if eoaAcc == nil {
+		t.Fatal("GetAccount over a code-free account's proof returned no account")
 	}
 }
