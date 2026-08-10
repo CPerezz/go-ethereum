@@ -700,6 +700,26 @@ func TestRecoverableDisabled(t *testing.T) {
 	}
 }
 
+// TestWitnessOnlyRefusesUpdate pins that a database rebuilt from an execution
+// witness cannot be written to.
+//
+// The binary tree relies on it: a witness-backed trie skips the deletion
+// bookkeeping that only a commit reads, which is sound exactly because no commit
+// can follow. That argument is worth enforcing rather than leaving in a comment.
+func TestWitnessOnlyRefusesUpdate(t *testing.T) {
+	db := New(rawdb.NewMemoryDatabase(), WitnessDefaults, true)
+	defer db.Close()
+
+	if !db.WitnessOnly() {
+		t.Fatal("a database built with WitnessDefaults does not report itself witness-only")
+	}
+	states := NewStateSetWithOrigin(nil, nil, nil, nil, false)
+	err := db.Update(common.Hash{0x01}, types.EmptyBinaryHash, 1, trienode.NewMergedNodeSet(), states)
+	if !errors.Is(err, errDatabaseWitnessOnly) {
+		t.Fatalf("update on a witness-backed database: got %v, want errDatabaseWitnessOnly", err)
+	}
+}
+
 func TestExecuteRollback(t *testing.T) {
 	// Redefine the diff layer depth allowance for faster testing.
 	maxDiffLayers = 4

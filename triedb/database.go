@@ -417,3 +417,13 @@ func (db *Database) SnapshotCompleted() bool {
 	}
 	return pdb.SnapshotCompleted()
 }
+
+// WitnessOnly reports whether the database was rebuilt from an execution
+// witness and will therefore never be committed to.
+func (db *Database) WitnessOnly() bool {
+	pdb, ok := db.backend.(*pathdb.Database)
+	if !ok {
+		return false
+	}
+	return pdb.WitnessOnly()
+}
