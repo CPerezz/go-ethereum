@@ -53,6 +53,14 @@ type Witness struct {
 	// only thing that can find it again.
 	Nodes map[string][]byte
 
+	// Proof is the encoded binary-tree multiproof over the pre-state root, and
+	// replaces Nodes on the wire where it is set.
+	//
+	// The difference is what each one is worth to a verifier. A node set is only
+	// as complete as the builder happened to be, and nothing in it says so; a
+	// proof either recomputes the root it claims or is refused.
+	Proof []byte
+
 	chain HeaderReader  // Chain reader to convert block hash ops to header proofs
 	stats *WitnessStats // Optional statistics collector
 	lock  sync.Mutex    // Lock to allow concurrent state insertions
@@ -155,6 +163,22 @@ func (w *Witness) AddNodes(nodes map[string][]byte) {
 	}
 }
 
+// AddProof attaches the encoded binary-tree multiproof over the pre-state root.
+//
+// An empty proof is dropped rather than stored, so that absent and
+// present-but-empty stay one state. What keeps such a witness encoding to the
+// bytes it always did is toExtPBT, which writes the field only for a proof that
+// has something in it.
+func (w *Witness) AddProof(proof []byte) {
+	if len(proof) == 0 {
+		return
+	}
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	w.Proof = proof
+}
+
 // Copy deep-copies the witness object.  Witness.Block isn't deep-copied as it
 // is never mutated by Witness
 func (w *Witness) Copy() *Witness {
@@ -163,6 +187,7 @@ func (w *Witness) Copy() *Witness {
 		Codes:   maps.Clone(w.Codes),
 		State:   maps.Clone(w.State),
 		Nodes:   maps.Clone(w.Nodes),
+		Proof:   slices.Clone(w.Proof),
 		chain:   w.chain,
 	}
 	if w.stats != nil {

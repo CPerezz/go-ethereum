@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 func TestWitnessToExtWitnessOrdersFields(t *testing.T) {
@@ -91,6 +92,90 @@ func TestWitnessFromExtWitnessRejectsEmptyHeaders(t *testing.T) {
 	var witness Witness
 	if err := witness.FromExtWitness(&ExtWitness{}); err == nil {
 		t.Fatal("expected empty witness error")
+	}
+}
+
+// TestWitnessProofEncoding covers the field the binary tree's proof travels in.
+//
+// The load-bearing property is what a witness *without* a proof encodes to: the
+// field is optional and trails the ones upstream has, so a merkle witness has to
+// come out byte-for-byte as it did before the field existed. rlp decides that by
+// looking for a zero value, which an allocated-but-empty slice is not, so the
+// nil handling is part of the format rather than tidiness.
+func TestWitnessProofEncoding(t *testing.T) {
+	merkle := &Witness{
+		Headers: []*types.Header{testHeader(1)},
+		Codes:   map[string]struct{}{string([]byte{0x01}): {}},
+		State:   map[string]struct{}{string([]byte{0x02}): {}},
+	}
+	before, err := rlp.EncodeToBytes(merkle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Four elements: headers, codes, state, and the empty keys list. A fifth would
+	// mean every merkle witness on the wire changed shape.
+	var elems []rlp.RawValue
+	if err := rlp.DecodeBytes(before, &elems); err != nil {
+		t.Fatal(err)
+	}
+	if len(elems) != 4 {
+		t.Fatalf("a witness with no proof encodes to %d elements, want 4", len(elems))
+	}
+	// An empty proof is the same statement as no proof, and must not add one.
+	merkle.AddProof(nil)
+	merkle.AddProof([]byte{})
+	after, err := rlp.EncodeToBytes(merkle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("an empty proof changed the encoding:\n before %x\n after  %x", before, after)
+	}
+	// A real proof round-trips, and lands in Proof rather than in the node set.
+	proof := []byte{0x03, 0x21, 0xaa}
+	merkle.AddProof(proof)
+	blob, err := rlp.EncodeToBytes(merkle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Witness
+	if err := rlp.DecodeBytes(blob, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Proof, proof) {
+		t.Fatalf("decoded proof is %x, want %x", got.Proof, proof)
+	}
+	if len(got.Nodes) != 0 {
+		t.Fatalf("a proof witness decoded %d path-keyed nodes", len(got.Nodes))
+	}
+}
+
+// TestWitnessFromExtWitnessRejectsTwoDescriptions pins that a witness cannot
+// carry both a proof and a node set. They describe the same tree, and accepting
+// both would leave the sender to decide which one the reader believed.
+func TestWitnessFromExtWitnessRejectsTwoDescriptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ext  *ExtWitness
+	}{
+		{"proof and keys", &ExtWitness{
+			Headers: []*types.Header{testHeader(1)},
+			Keys:    []hexutil.Bytes{{0x00, 0x01}},
+			State:   []hexutil.Bytes{{0xaa}},
+			Proof:   hexutil.Bytes{0x03},
+		}},
+		{"proof and state", &ExtWitness{
+			Headers: []*types.Header{testHeader(1)},
+			State:   []hexutil.Bytes{{0xaa}},
+			Proof:   hexutil.Bytes{0x03},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var w Witness
+			if err := w.FromExtWitness(tc.ext); err == nil {
+				t.Fatal("a witness describing its state twice was accepted")
+			}
+		})
 	}
 }
 
