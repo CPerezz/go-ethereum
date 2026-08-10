@@ -135,6 +135,47 @@ func TestPBTStatelessExecution(t *testing.T) {
 	}
 }
 
+// TestPBTStatelessExecutionWithAccessList replays a block that carries its
+// EIP-7928 access list, which is the shape ExecuteStatelessPayloadV5 hands the
+// runner: ExecutableDataToBlockNoHash attaches the list, while every other
+// caller builds the task through WithBody and loses it.
+//
+// Replay is held to the sequential processor for exactly this case. The parallel
+// one reads through ReaderWithBlockLevelAccessList, which answers from the list
+// itself, so a read the witness never covered would be served rather than
+// faulting.
+func TestPBTStatelessExecutionWithAccessList(t *testing.T) {
+	chain, block, witness := pbtWitnessFixture(t)
+
+	header := types.CopyHeader(block.Header())
+	header.Root, header.ReceiptHash = common.Hash{}, common.Hash{}
+	task := types.NewBlockWithHeader(header).WithBody(*block.Body())
+	al := block.AccessList()
+	if al == nil {
+		t.Fatal("the fixture block carries no access list, so this proves nothing")
+	}
+	task = task.WithAccessListUnsafe(al)
+
+	stateRoot, receiptRoot, err := ExecuteStateless(context.Background(), chain.Config(), vm.Config{}, task, witness)
+	if err != nil {
+		t.Fatalf("stateless execution of a block carrying an access list failed: %v", err)
+	}
+	if stateRoot != block.Root() {
+		t.Fatalf("stateless state root mismatch: got %x, want %x", stateRoot, block.Root())
+	}
+	if receiptRoot != block.ReceiptHash() {
+		t.Fatalf("stateless receipt root mismatch: got %x, want %x", receiptRoot, block.ReceiptHash())
+	}
+	// The completeness check has to still fire with the list attached. Any
+	// single node will do; TestPBTStatelessRejectsIncompleteWitness proves
+	// exhaustively that every one of them is load-bearing.
+	holed := witness.Copy()
+	delete(holed.Nodes, slices.Sorted(maps.Keys(witness.Nodes))[0])
+	if root, _, err := ExecuteStateless(context.Background(), chain.Config(), vm.Config{}, task, holed); err == nil {
+		t.Fatalf("a holed witness still executed, returning root %x", root)
+	}
+}
+
 // TestPBTStatelessExecutionWithWrites covers a block that creates state rather
 // than only reading it.
 //

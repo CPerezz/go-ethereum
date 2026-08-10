@@ -55,13 +55,10 @@ import (
 // layer. PBT is a standalone config flag rather than an Amsterdam consequence,
 // so merkle-at-Amsterdam is a real configuration.
 //
-// Be clear about what the Amsterdam arm does and does not establish. It does
-// take the parallel processor, which is the path an Amsterdam node takes and
-// which nothing else in the tree exercises - the assertion below makes sure of
-// that, because the access list is easy to drop by accident. What it cannot
-// show is that the completeness check would catch an unwitnessed read there:
-// on that path every transaction runs against its own statedb whose error is
-// never consulted, so only the root comparison is doing work. See TODO.md.
+// The Amsterdam arm carries the block's access list, which the assertion below
+// enforces because WithBody drops it silently. Replay still runs sequentially:
+// ExecuteStateless disables the parallel processor, whose reads go through the
+// access list itself and would answer what the witness never covered.
 func TestStatelessContractCoinbaseMerkle(t *testing.T) {
 	amsterdam := *testPBTChainConfig
 	amsterdam.PBT = false // same forks, merkle state
@@ -149,19 +146,15 @@ func statelessContractCoinbaseMerkle(t *testing.T, config params.ChainConfig) {
 	}
 	header := types.CopyHeader(blocks[0].Header())
 	header.Root, header.ReceiptHash = common.Hash{}, common.Hash{}
-	// Carry the access list across explicitly. types.Body has no field for it
-	// and WithBody takes it from the receiver, so the obvious construction
-	// hands ExecuteStateless a nil-BAL block, which silently routes it to the
-	// sequential processor - not the path an Amsterdam node takes.
+	// Carry the access list across explicitly: types.Body has no field for it and
+	// WithBody takes it from the receiver, so the obvious construction hands
+	// ExecuteStateless a nil-BAL block.
 	task := types.NewBlockWithHeader(header).WithBody(*blocks[0].Body())
 	if al := blocks[0].AccessList(); al != nil {
 		task = task.WithAccessListUnsafe(al)
 	}
-	// Without the access list the replay quietly takes the sequential
-	// processor, which is not what an Amsterdam node does and would make this
-	// subtest a duplicate of the Osaka one.
 	if config.IsAmsterdam(blocks[0].Number(), blocks[0].Time()) && task.AccessList() == nil {
-		t.Fatal("the Amsterdam task carries no access list, so the replay would not take the parallel path")
+		t.Fatal("the Amsterdam task carries no access list, so it is not the shape the engine API replays")
 	}
 
 	stateRoot, _, err := ExecuteStateless(context.Background(), chain.Config(), vm.Config{}, task, witness)

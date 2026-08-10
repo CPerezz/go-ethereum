@@ -53,6 +53,11 @@ func ExecuteStateless(ctx context.Context, config *params.ChainConfig, vmconfig 
 	if block.ReceiptHash() != (common.Hash{}) {
 		log.Error("stateless runner received receipt root it's expected to calculate (faulty consensus client)", "block", block.Number())
 	}
+	// Replay stays sequential even for a block carrying an access list. The
+	// parallel processor reads through ReaderWithBlockLevelAccessList, which
+	// answers from the list itself, so a read the witness never covered would be
+	// served rather than faulting.
+	vmconfig.DisableParallelExecution = true
 	// Create and populate the state database to serve as the stateless backend.
 	//
 	// The two trees are rebuilt differently because they are addressed
@@ -97,29 +102,10 @@ func ExecuteStateless(ctx context.Context, config *params.ChainConfig, vmconfig 
 	receiptRoot := types.DeriveSha(res.Receipts, trie.NewStackTrie(nil))
 	stateRoot := db.IntermediateRoot(config.IsEIP158(block.Number()))
 
-	// A witness that did not cover everything the block touched does not fail
-	// the execution above. A missing node is latched into the state database's
-	// error and the read is answered as an absent account or a zero slot, so
-	// the run completes and returns a root computed from state that was never
-	// there. IntermediateRoot does not consult that error either, which leaves
-	// the mismatch to be discovered by whoever compares roots - or not at all,
-	// where the caller trusts what it gets back.
-	//
-	// This used to be scoped to the binary tree, because merkle witnesses did
-	// not capture every bytecode they read: updateStateObject asked for a code
-	// size on the account-write path, which loaded the whole contract through
-	// the reader without any AddCode recording it. That read is gone - the
-	// binary tree takes the size from the stem it is writing, and the merkle
-	// trie never needed it - so both are held to the same standard here.
-	//
-	// The check is load-bearing rather than advisory now: a latched error fails
-	// the block instead of surfacing later as a root comparison. Be precise
-	// about what it observes, though. It sees the reads this statedb makes -
-	// the sequential processor's execution, the block access list apply, and
-	// the hashing. On the parallel path each transaction runs against its own
-	// statedb whose error is never consulted, so a read inside a transaction is
-	// not covered here at all. TODO.md carries that gap, along with the two
-	// unwitnessed code reads that remain and why neither fires today.
+	// An uncovered read does not fail the execution above: the missing node is
+	// latched here and the read answered as an absent account or a zero slot, and
+	// IntermediateRoot never consults the error. So this check is what fails the
+	// block, rather than a root comparison somewhere the caller may not make.
 	if err := db.Error(); err != nil {
 		return common.Hash{}, common.Hash{}, fmt.Errorf("incomplete witness: %w", err)
 	}

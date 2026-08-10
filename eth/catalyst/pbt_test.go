@@ -163,3 +163,104 @@ func TestPBTNodeProducesAndImportsBlocks(t *testing.T) {
 		t.Fatalf("balance grew without transactions: %v", got)
 	}
 }
+
+// TestPBTWitnessRoundTrip drives the Amsterdam witness endpoints against a
+// binary tree node: a build requested with a witness, that witness consumed
+// statelessly, and the same loop again through payload import.
+func TestPBTWitnessRoundTrip(t *testing.T) {
+	genesis := pbtGenesis()
+	n, ethservice := startEthService(t, genesis, nil)
+	defer n.Close()
+
+	api := newConsensusAPIWithoutHeartbeat(ethservice)
+	parent := ethservice.BlockChain().CurrentBlock()
+
+	// The payload has to carry a transaction, or the round trip proves nothing
+	// about a witness. params.TxGas is below Amsterdam's intrinsic cost and a
+	// rejected transaction yields an empty block rather than an error, so the
+	// gas limit is generous and the transaction count is asserted below.
+	tx, err := types.SignTx(
+		types.NewTransaction(0, common.Address{0xaa}, big.NewInt(1), 1_000_000, big.NewInt(2*params.InitialBaseFee), nil),
+		types.LatestSigner(genesis.Config), testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs := ethservice.TxPool().Add([]*types.Transaction{tx}, true); errs[0] != nil {
+		t.Fatalf("adding transaction to the pool: %v", errs[0])
+	}
+
+	slot, targetGasLimit := uint64(1), parent.GasLimit
+	attrs := &engine.PayloadAttributes{
+		Timestamp:             parent.Time + 12,
+		Random:                common.Hash{},
+		SuggestedFeeRecipient: common.Address{},
+		Withdrawals:           []*types.Withdrawal{},
+		BeaconRoot:            &common.Hash{42},
+		SlotNumber:            &slot,
+		TargetGasLimit:        &targetGasLimit,
+	}
+	fcState := engine.ForkchoiceStateV1{HeadBlockHash: parent.Hash()}
+	resp, err := api.ForkchoiceUpdatedWithWitnessV4(context.Background(), fcState, attrs, nil)
+	if err != nil {
+		t.Fatalf("requesting a build with a witness: %v", err)
+	}
+	if resp.PayloadStatus.Status != engine.VALID {
+		t.Fatalf("forkchoice update not valid: %v (%s)", resp.PayloadStatus.Status, derefErr(resp.PayloadStatus.ValidationError))
+	}
+	// Resolve the full payload rather than the empty one: getPayload waits for
+	// the build to finish, GetPayloadV6 would return whatever is ready.
+	envelope, err := api.getPayload(*resp.PayloadID, true, nil, nil)
+	if err != nil {
+		t.Fatalf("payload retrieval failed: %v", err)
+	}
+	if len(envelope.ExecutionPayload.Transactions) != 1 {
+		t.Fatalf("payload carries %d transactions, want 1", len(envelope.ExecutionPayload.Transactions))
+	}
+	if envelope.Witness == nil {
+		t.Fatal("witness missing from payload")
+	}
+	// GetPayloadV6 is the only getter whose gate admits an Amsterdam payload.
+	if _, err := api.GetPayloadV6(*resp.PayloadID); err != nil {
+		t.Fatalf("getPayloadV6 rejected an amsterdam payload: %v", err)
+	}
+	execData := envelope.ExecutionPayload
+	// V4's gate is the reason V5 exists: it admits Prague through Bogota.
+	if _, err := api.ExecuteStatelessPayloadV4(*execData, []common.Hash{}, &common.Hash{42}, []hexutil.Bytes{}, *envelope.Witness); err == nil {
+		t.Fatal("executeStatelessPayloadV4 accepted an amsterdam payload")
+	}
+	consume := func(witness hexutil.Bytes) engine.StatelessPayloadStatusV1 {
+		t.Helper()
+		wantStateRoot, wantReceiptRoot := execData.StateRoot, execData.ReceiptsRoot
+		execData.StateRoot, execData.ReceiptsRoot = common.Hash{}, common.Hash{}
+		defer func() { execData.StateRoot, execData.ReceiptsRoot = wantStateRoot, wantReceiptRoot }()
+
+		res, err := api.ExecuteStatelessPayloadV5(*execData, []common.Hash{}, &common.Hash{42}, []hexutil.Bytes{}, witness)
+		if err != nil {
+			t.Fatalf("stateless execution failed: %v", err)
+		}
+		if res.Status != engine.VALID {
+			t.Fatalf("stateless execution not valid: %v (%s)", res.Status, derefErr(res.ValidationError))
+		}
+		if res.StateRoot != wantStateRoot {
+			t.Fatalf("stateless state root mismatch: have %v, want %v", res.StateRoot, wantStateRoot)
+		}
+		if res.ReceiptsRoot != wantReceiptRoot {
+			t.Fatalf("stateless receipt root mismatch: have %v, want %v", res.ReceiptsRoot, wantReceiptRoot)
+		}
+		return res
+	}
+	consume(*envelope.Witness)
+
+	// The witness a payload import produces has to replay the same way.
+	status, err := api.NewPayloadWithWitnessV5(context.Background(), *execData, []common.Hash{}, &common.Hash{42}, []hexutil.Bytes{})
+	if err != nil {
+		t.Fatalf("payload import failed: %v", err)
+	}
+	if status.Status != engine.VALID {
+		t.Fatalf("imported payload not valid: %v (%s)", status.Status, derefErr(status.ValidationError))
+	}
+	if status.Witness == nil {
+		t.Fatal("witness missing from imported payload")
+	}
+	consume(*status.Witness)
+}

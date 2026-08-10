@@ -3,33 +3,6 @@
 Known gaps in the EIP-8297 binary tree (PBT) work, recorded so they are not
 rediscovered by accident.
 
-## The engine API has no stateless-consume or witness-build path for the tree
-
-`eth/catalyst/witness.go` has `NewPayloadWithWitnessV1` through **`V5`**,
-`ExecuteStatelessPayloadV1` through `V4`, and `ForkchoiceUpdatedWithWitnessV1`
-through `V3`. So *producing* a binary tree witness already works:
-`NewPayloadWithWitnessV5` is gated on `forks.Amsterdam` and returns one on
-payload insertion.
-
-What is missing is the other two directions:
-
-- **Consumption** — an `ExecuteStatelessPayloadV5`. `V4` stops at Bogota.
-- **Requesting a build with a witness** — a `ForkchoiceUpdatedWithWitnessV4`.
-  `V3` stops at Bogota too.
-
-Both refuse cleanly meanwhile rather than misbehaving, because **Amsterdam is
-absent from both fork gates**. `ExecuteStatelessPayloadV4` admits
-`Prague, Osaka, BPO1-5, Bogota`, so a binary tree payload is rejected with
-*"newPayloadV4 must only be called for prague/osaka payloads"* well before
-reaching `ExecuteStateless`. `ForkchoiceUpdatedWithWitnessV3` admits that set
-plus `Cancun`, and only checks it when payload attributes are present — which
-is exactly the case that requests a build, so the gap that matters is covered.
-
-Shape to copy: `TestWitnessCreationAndConsumption` (`eth/catalyst/api_test.go`)
-drives the whole loop, but only at V3. The binary tree fixture to extend is
-`TestPBTNodeProducesAndImportsBlocks` (`eth/catalyst/pbt_test.go`), which never
-touches witnesses today.
-
 ## The witness could be a multiproof
 
 The witness ships the nodes a block resolved, which is the same shape as the
@@ -236,9 +209,9 @@ to look.
   now; what deliberately remains open is the next bullet.
 - **EEST fixtures run, with three deliberate gaps.** The BinaryTree suite
   passes via `consume direct` and the Go harness, path scheme only. Open:
-  engine-format fixtures need a `consume engine` path (see the catalyst
-  entry), CI does not download binary-tree fixtures, and the
-  transaction-test fork list has no `BinaryTree` entry.
+  engine-format fixtures need a `consume engine` path, CI does not download
+  binary-tree fixtures, and the transaction-test fork list has no `BinaryTree`
+  entry.
 - **`evm statetest` hard-codes the hash scheme** (`cmd/evm/staterunner.go`),
   harmless only because `RunNoVerify` builds its own path-scheme prestate on
   the PBT path.
