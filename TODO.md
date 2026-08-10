@@ -17,32 +17,22 @@ keys a block touched, covering written stems whole (`insStem` refuses a write
 into a partially shipped stem), and the absence handling the multiproof already
 grew. `TestMultiproofSize` exists to measure the swap when it happens.
 
-## Two remaining unwitnessed paths to `stateObject.Code()`
+## One unwitnessed path to `stateObject.Code()`, and it cannot be reached
 
-`Witness.AddCode` is reached only from `StateDB.GetCode` and
-`StateDB.GetCodeSize`, so a `stateObject.Code()` arriving by any other route
-goes unrecorded. The replay then substitutes empty code and carries on, because
-`setError` only latches and `IntermediateRoot` never consults it — a wrong root
-reported as a good one.
+`Witness.AddCode` is reached from `StateDB.GetCode` and `StateDB.GetCodeSize`,
+and now from `recordAccessListChanges`, so a `stateObject.Code()` arriving by
+any other route goes unrecorded. The replay then substitutes empty code and
+carries on, because `setError` only latches and `IntermediateRoot` never
+consults it — a wrong root reported as a good one.
 
-The path that actually fired was `updateStateObject`, which asked for a code
-size on every dirty account and loaded the whole contract to measure it. That
-is fixed: the binary tree takes the size from the stem it is writing, the
-merkle trie never needed it, and `core/stateless.go` now holds both trees to
-the completeness check. Two dormant ones are left.
-
-- `recordAccessListChanges` (`core/state/statedb.go`) calls `obj.Code()` under
-  `state.codeSet`. Amsterdam/BAL only, and only for accounts with a journalled
-  `SetCode`, whose blob is already in hand — so it does not reach the reader
-  today. Note that this holds by a cache hit rather than by construction:
-  `Code()` short-circuits on `len(s.code) != 0`.
-- `ReaderWithBlockLevelAccessList.Code`/`CodeSize`
-  (`core/state/reader_eip_7928.go`) read code below the `AddCode` layer
-  entirely, falling through to the wrapped reader on an access-list miss.
-
-Neither is reachable in a way that breaks a block today. Both would be found by
-the same test shape that caught the first: a block that touches a contract it
-never executes, replayed with the completeness check on.
+`ReaderWithBlockLevelAccessList.Code`/`CodeSize` (`core/state/reader_eip_7928.go`)
+read code below the `AddCode` layer entirely, falling through to the wrapped
+reader on an access-list miss. That reader is constructed only inside
+`processParallel`, and `supportsParallelExecution` refuses the parallel path
+whenever a witness is being collected, so the two never coexist: there is no
+block, valid or otherwise, that reaches it with a witness to record into. Should
+that exclusion ever be relaxed, this becomes live again and nothing here would
+notice.
 
 ## Is `code_size` worth putting in flat state?
 

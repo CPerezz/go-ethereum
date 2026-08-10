@@ -36,6 +36,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types/bal"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
@@ -996,6 +997,76 @@ func TestDeleteCreateRevert(t *testing.T) {
 
 	if state.getStateObject(addr) != nil {
 		t.Fatalf("self-destructed contract came alive")
+	}
+}
+
+// TestWitnessIncludesAccessListCodeRead covers the one code read that reaches
+// the reader without going through GetCode or GetCodeSize, the only two callers
+// of Witness.AddCode.
+//
+// recordAccessListChanges asks a dirty account for its code to decide whether to
+// record a code change. Today the blob is always resident there, because only a
+// journalled SetCode sets codeSet and that leaves it in hand - but that is a
+// cache hit rather than a guarantee, and an unwitnessed read replays as empty
+// code and a wrong root reported as a good one. So the state the guard exists
+// for is built directly: a committed contract, reopened, with the journal entry
+// but no resident blob.
+func TestWitnessIncludesAccessListCodeRead(t *testing.T) {
+	var (
+		db   = NewDatabaseForTesting()
+		addr = common.Address{0xc0, 0xde}
+		code = []byte{0x60, 0x01, 0x50}
+	)
+	state, _ := New(types.EmptyRootHash, db)
+	state.CreateAccount(addr)
+	state.SetCode(addr, code, tracing.CodeChangeUnspecified)
+	root, err := state.Commit(0, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		resident bool
+		want     int
+	}{
+		{"blob not resident", false, 1},
+		{"blob resident", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state, err := New(root, db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			witness := &stateless.Witness{
+				Codes: make(map[string]struct{}),
+				State: make(map[string]struct{}),
+			}
+			state.witness = witness
+			state.stateAccessList = bal.NewConstructionBlockAccessList()
+
+			obj := state.getStateObject(addr)
+			if obj == nil {
+				t.Fatal("the committed contract is not there")
+			}
+			if tc.resident && !bytes.Equal(obj.Code(), code) {
+				t.Fatal("the resident blob is not the committed code")
+			}
+			if !tc.resident && len(obj.code) != 0 {
+				t.Fatal("the blob is resident before anything read it")
+			}
+			// A code change is journalled, and the recorded value differs from what
+			// the account now holds, which is what makes the read happen.
+			state.recordAccessListChanges(addr, &journalMutationState{codeSet: true, code: nil})
+
+			if len(witness.Codes) != tc.want {
+				t.Fatalf("witness holds %d codes, want %d", len(witness.Codes), tc.want)
+			}
+			if tc.want == 1 {
+				if _, ok := witness.Codes[string(code)]; !ok {
+					t.Fatal("the witness holds a code that is not the one read")
+				}
+			}
+		})
 	}
 }
 

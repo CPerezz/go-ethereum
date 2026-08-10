@@ -968,7 +968,15 @@ func (s *StateDB) recordAccessListChanges(addr common.Address, state *journalMut
 	if state.codeSet {
 		var code []byte
 		if obj != nil {
+			// Code() short-circuits on a resident blob and otherwise reads through
+			// the reader, so only the second case is a state access the witness has
+			// to carry. A journalled SetCode leaves the blob resident, which is why
+			// this does not fire today - a cache hit rather than a guarantee.
+			resident := len(obj.code) != 0
 			code = obj.Code()
+			if !resident && s.witness != nil {
+				s.witness.AddCode(code)
+			}
 		}
 		if !bytes.Equal(code, state.code) {
 			s.stateAccessList.CodeChange(addr, s.blockAccessIndex, code)

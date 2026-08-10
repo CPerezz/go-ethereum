@@ -291,6 +291,9 @@ func (r *ReaderWithBlockLevelAccessList) Has(addr common.Address, codeHash commo
 // Code implements Reader, returning the contract code with specified address
 // and hash. Code created earlier in the block (and therefore absent from the
 // pre-transition state) is served directly from the access list.
+//
+// This reads below the layer that records into an execution witness, which is
+// safe only because a witness disables the parallel path this reader belongs to.
 func (r *ReaderWithBlockLevelAccessList) Code(addr common.Address, codeHash common.Hash) []byte {
 	if code, ok := r.lookup.Code(addr, r.txIndex); ok {
 		return code
