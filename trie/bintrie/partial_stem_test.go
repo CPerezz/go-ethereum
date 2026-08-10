@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/trie"
 )
 
@@ -285,6 +286,59 @@ func TestProofRequestKinds(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestWitnessOnlySkipsSubtreeEnumeration pins the one behaviour a witness-backed
+// tree has that a committing one does not.
+//
+// Dropping a prefix normally walks the whole detached subtree to record which
+// records the commit has to delete. A tree rebuilt from a proof is never
+// committed, so that list is never read - and the walk would fault on the first
+// record the proof had no reason to carry, turning a valid block into a rejected
+// one. The flag is carried by Copy for the same reason: a copy that lost it would
+// re-enable the walk mid-replay.
+func TestWitnessOnlySkipsSubtreeEnumeration(t *testing.T) {
+	// A branch whose prefix covers the whole bucket, with both children
+	// unresolved - which is what a proof that never opened them looks like.
+	prefix := StorageBucketPrefix(common.Address{0xbb})
+	newRoot := func() *branchNode {
+		return &branchNode{
+			prefix: slice(prefix, 0, 8*len(prefix)),
+			left:   hashedNode(common.Hash{0x11}),
+			right:  hashedNode(common.Hash{0x22}),
+		}
+	}
+	for _, tc := range []struct {
+		name        string
+		witnessOnly bool
+		wantErr     bool
+	}{
+		{"committing tree resolves the subtree", false, true},
+		{"witness-backed tree detaches it", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := partialTrie(t, newRoot())
+			tr.witnessOnly = tc.witnessOnly
+
+			err := tr.DeletePrefix(prefix)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("dropping a prefix over unresolved children succeeded")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("dropping a prefix on a witness-backed tree: %v", err)
+			}
+			if got := tr.Hash(); got != types.EmptyBinaryHash {
+				t.Fatalf("the bucket did not detach: root is %x", got)
+			}
+			// Copy has to carry the flag, or the next operation walks again.
+			if !tr.Copy().witnessOnly {
+				t.Fatal("Copy dropped the witness-only flag")
+			}
+		})
+	}
 }
 
 // TestWholeStemUnaffected is the control: the guard added for partial stems
