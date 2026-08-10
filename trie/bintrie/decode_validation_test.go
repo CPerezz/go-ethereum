@@ -170,6 +170,40 @@ func TestDecodeRejectsOverlongPrefix(t *testing.T) {
 // enough to hold a key and a value, so a short node produced a negative bound
 // and panicked. The caller supplies the root here, which is exactly the position
 // an untrusted proof puts them in.
+// TestProveEmptyTreeRefused pins that a tree with nothing in it cannot be
+// proved.
+//
+// The walk emits no token for an empty root, and a proof of no tokens decodes
+// back to nothing and is refused - so returning it as a success would hand the
+// caller bytes that drop silently and a witness that carries no state. The
+// caller has to recognise an empty pre-state itself.
+func TestProveEmptyTreeRefused(t *testing.T) {
+	tr := partialTrie(t, empty{})
+	if _, err := tr.ProveRequests(ProofRequests{Paths: []ProofPath{{Bits: 0}}}); !errors.Is(err, ErrProofMalformed) {
+		t.Fatalf("proving an empty tree: got %v, want ErrProofMalformed", err)
+	}
+}
+
+// TestRemoveStemValidatesStem pins that a malformed stem is refused before it is
+// recorded.
+//
+// The recorder feeds one proof for the whole block, and ProveRequests fails the
+// entire set on the first bad stem - so an unvalidated stem here would cost the
+// block its proof rather than costing this call its answer.
+func TestRemoveStemValidatesStem(t *testing.T) {
+	_, whole, _ := partialFixture(t, []byte{0x05, 0x80})
+	tr := partialTrie(t, whole)
+	tr.SetProofRecorder(NewProofRecorder())
+
+	if err := tr.removeStem([]byte{AccountZone, 0x01}); err == nil {
+		t.Fatal("removing a stem of the wrong length succeeded")
+	}
+	// The block's proof must be unaffected: only the seeded root request remains.
+	if got := tr.recorder.Len(); got != 1 {
+		t.Fatalf("the recorder holds %d requests, want only the seeded root", got)
+	}
+}
+
 func TestVerifyProofRejectsMalformedLeaf(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

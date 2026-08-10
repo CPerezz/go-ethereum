@@ -203,6 +203,13 @@ func (t *BinaryTrie) ProveRequests(req ProofRequests) (*Multiproof, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A proof of nothing is not a proof: it encodes to no bytes, which decodes
+	// back to no tokens and is refused. Only a wholly empty tree gets here, and
+	// its caller has to recognise that rather than ship a witness whose proof was
+	// quietly dropped.
+	if len(mp.tokens) == 0 {
+		return nil, ErrProofMalformed
+	}
 	t.root = n
 	return mp, nil
 }
@@ -221,7 +228,16 @@ func (t *BinaryTrie) proveMultiWalk(n binaryNode, tgts []proofTarget, pos int, m
 	}
 	switch nn := n.(type) {
 	case empty:
-		// Every request here is answered absent, and an empty tree proves it.
+		// Only a wholly empty tree, which has nothing to prove. Below the root an
+		// empty side would emit no token while its parent's branch token expects
+		// two subtrees, and rebuild consumes positionally - so the stream would
+		// desynchronise a level away from the cause. Canonical trees have no such
+		// side (decodeNode refuses a branch with a zero child, and collapse
+		// refuses any survivor that is not a branch or a group), and this is
+		// where that stops being an assumption.
+		if pos != 0 {
+			return n, ErrProofMalformed
+		}
 		return n, nil
 
 	case hashedNode:
