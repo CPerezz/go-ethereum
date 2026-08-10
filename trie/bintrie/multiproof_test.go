@@ -216,14 +216,12 @@ func TestMultiproofRejectsForgery(t *testing.T) {
 	})
 
 	t.Run("mutated byte", func(t *testing.T) {
-		// Not every single-byte change is caught; the old assertion passed
-		// only because its sampling stepped over the bytes that survive. Some
-		// sub-indices are not authenticated individually, so the encoding is
-		// malleable there. See TODO.md.
+		// Every byte of the encoding is authenticated: the bitmaps carry only
+		// load-bearing sub-indices, so a flip in one either contradicts the shape
+		// the rest of the token implies or changes a preimage the root covers.
 		//
-		// What must hold is the property malleability could threaten: no flip
-		// may change a value the proof proves. So every byte is tried, and a
-		// survivor has to answer every key exactly as before.
+		// A survivor would not necessarily be unsound, so the stronger property is
+		// asserted too: it would still have to answer every key exactly as before.
 		want := make([][]byte, len(keys))
 		for i, k := range keys {
 			v, err := src.GetStemValue(k)
@@ -234,28 +232,71 @@ func TestMultiproofRejectsForgery(t *testing.T) {
 		}
 		survivors := 0
 		for i := range blob {
-			bad := bytes.Clone(blob)
-			bad[i] ^= 0x01
-			decoded, err := bintrie.DecodeMultiproof(bad)
-			if err != nil {
-				continue
-			}
-			verified, err := bintrie.VerifyMultiproof(root, decoded)
-			if err != nil {
-				continue
-			}
-			survivors++
-			for j, k := range keys {
-				got, err := verified.GetStemValue(k)
+			for bit := 0; bit < 8; bit++ {
+				bad := bytes.Clone(blob)
+				bad[i] ^= 1 << bit
+				decoded, err := bintrie.DecodeMultiproof(bad)
 				if err != nil {
-					t.Fatalf("byte %d flipped: key %x now errors: %v", i, k, err)
+					continue
 				}
-				if !bytes.Equal(got, want[j]) {
-					t.Fatalf("byte %d flipped: key %x proves %x, want %x", i, k, got, want[j])
+				verified, err := bintrie.VerifyMultiproof(root, decoded)
+				if err != nil {
+					continue
+				}
+				survivors++
+				for j, k := range keys {
+					got, err := verified.GetStemValue(k)
+					if err != nil {
+						t.Fatalf("byte %d bit %d flipped: key %x now errors: %v", i, bit, k, err)
+					}
+					if !bytes.Equal(got, want[j]) {
+						t.Fatalf("byte %d bit %d flipped: key %x proves %x, want %x", i, bit, k, got, want[j])
+					}
 				}
 			}
 		}
-		t.Logf("%d of %d byte flips still verified; none changed a proved value", survivors, len(blob))
+		if survivors != 0 {
+			t.Errorf("%d of %d single-bit flips still verified", survivors, 8*len(blob))
+		}
+	})
+
+	// Shapes a prover never emits, hand-built because ProveMulti cannot reach
+	// them. Both verified against an arbitrary root before they were refused.
+	t.Run("degenerate shapes", func(t *testing.T) {
+		var (
+			stem  = bintrie.BasicDataKey(addr)[:bintrie.AccountKeyLength-1]
+			zeros [32]byte
+		)
+		group := func(present, covered [32]byte, tail ...byte) []byte {
+			out := append([]byte{0x03, byte(len(stem))}, stem...)
+			out = append(out, present[:]...)
+			out = append(out, covered[:]...)
+			return append(out, tail...)
+		}
+		var oneBit [32]byte
+		oneBit[0] = 0x80 // sub-index 0
+
+		for _, tc := range []struct {
+			name string
+			blob []byte
+		}{
+			// A lone stub is returned as the hash it carries, so it used to hash to
+			// whatever root it claimed.
+			{"root-level stub", append([]byte{0x02}, root[:]...)},
+			// A group covering nothing folds to one hash, leaving its stem and both
+			// bitmaps outside every preimage.
+			{"group covering nothing", group(oneBit, zeros, root[:]...)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				decoded, err := bintrie.DecodeMultiproof(tc.blob)
+				if err != nil {
+					return // refused at decode, which is enough
+				}
+				if _, err := bintrie.VerifyMultiproof(root, decoded); err == nil {
+					t.Fatal("verified")
+				}
+			})
+		}
 	})
 
 	t.Run("trailing bytes", func(t *testing.T) {
@@ -264,6 +305,46 @@ func TestMultiproofRejectsForgery(t *testing.T) {
 			t.Fatal("a proof with trailing bytes decoded")
 		}
 	})
+}
+
+// TestMultiproofCanonicalBitmaps pins that a partially covered group ships only
+// the sub-indices its fold shape needs, and that the decoder demands exactly
+// that set.
+//
+// The prover and the verifier have to agree on the rule, and only one of them
+// having it is silent: a decoder that recomputed a smaller set than the prover
+// emits would refuse every honest proof of a partially covered group, and a
+// prover that pruned without the decoder checking would leave the bitmaps
+// malleable. A 256-leaf code group read at one chunk is the case with the most
+// to prune.
+func TestMultiproofCanonicalBitmaps(t *testing.T) {
+	db, root, addr, codeHash := mpFixture(t, 24576, 64)
+
+	src := openTrie(t, db, root)
+	mp, err := src.ProveMulti([][]byte{
+		bintrie.BasicDataKey(addr),
+		bintrie.CodeHashKey(addr),
+		bintrie.CodeChunkKey(codeHash, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := mp.Encode()
+	decoded, err := bintrie.DecodeMultiproof(blob)
+	if err != nil {
+		t.Fatalf("the prover emitted a proof its own decoder refuses: %v", err)
+	}
+	verified, err := bintrie.VerifyMultiproof(root, decoded)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	// The code stem holds 256 chunks and one was read, so this is a partially
+	// covered group and there was something to prune. A chunk the proof left out
+	// has to report a missing node: that is what says the rest of the stem shipped
+	// as stubs rather than as bits in the bitmap.
+	if _, err := verified.GetStemValue(bintrie.CodeChunkKey(codeHash, 200)); err == nil {
+		t.Fatal("an uncovered chunk read back without error, so the group was not partially covered")
+	}
 }
 
 // TestMultiproofProvesAbsence covers the keys a proof says are *not* there.
