@@ -1057,6 +1057,19 @@ func (s *StateDB) finaliseAmsterdam(deleteEmptyObjects bool) *bal.ConstructionBl
 
 		case deleteEmptyObjects && obj.empty():
 			// EIP-161: a touched, empty account is removed.
+			//
+			// A touch changes no value, so recordAccessListChanges below reports
+			// nothing and the removal would be absent from the access list - and a
+			// consumer rebuilding the post-state from the list alone, as the parallel
+			// processor does, would keep the account. State it explicitly.
+			//
+			// Only for an account that existed: dropping one that was never there
+			// changes nothing, and several ordinary shapes touch an absent account,
+			// so recording those would put an entry in the list for blocks that have
+			// no state change to describe.
+			if obj.origin != nil {
+				s.stateAccessList.BalanceChange(s.blockAccessIndex, addr, new(uint256.Int))
+			}
 			delete(s.stateObjects, obj.address)
 			s.markDelete(addr)
 			if _, ok := s.stateObjectsDestruct[obj.address]; !ok {
@@ -1454,10 +1467,14 @@ func (s *StateDB) deleteStoragePBT(addrHash common.Hash) (map[common.Hash]common
 // In case (d), **original** account along with its storages should be deleted,
 // with their values be tracked as original value.
 //
-// The returned flag reports whether any destructed account's storage was
-// wiped (EIP-161 clearing of a storage-holding account: fixture-constructible,
-// mainnet-unreachable). Wiped slots are enumerated by hash, so the caller
-// degrades the update's storage-key encoding to match.
+// The returned flag reports whether any destructed account's storage was wiped
+// (EIP-161 clearing of a storage-holding account). Execution cannot produce such
+// an account - emptiness ignores storage, but reaching zero nonce, balance and
+// code takes a transaction, which bumps the nonce - so this needs state that
+// predates the rule: a genesis allocation, or the accounts a network carries from
+// before it adopted EIP-158, of which core/vm/eip7610.go lists 28 on mainnet.
+// Wiped slots are enumerated by hash, so the caller degrades the update's
+// storage-key encoding to match.
 func (s *StateDB) handleDestruction() (map[common.Hash]*AccountDelete, []*trienode.NodeSet, bool, error) {
 	var (
 		nodes   []*trienode.NodeSet
