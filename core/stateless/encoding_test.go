@@ -145,14 +145,16 @@ func TestWitnessProofEncoding(t *testing.T) {
 	if !bytes.Equal(got.Proof, proof) {
 		t.Fatalf("decoded proof is %x, want %x", got.Proof, proof)
 	}
-	if len(got.Nodes) != 0 {
-		t.Fatalf("a proof witness decoded %d path-keyed nodes", len(got.Nodes))
+	if len(got.State) != 0 {
+		t.Fatalf("a proof witness decoded %d merkle state nodes", len(got.State))
 	}
 }
 
 // TestWitnessFromExtWitnessRejectsTwoDescriptions pins that a witness cannot
-// carry both a proof and a node set. They describe the same tree, and accepting
-// both would leave the sender to decide which one the reader believed.
+// describe its state twice. A proof beside a merkle node set would leave the
+// sender to decide which one the reader believed; Keys carried the paths of the
+// node-set format the binary tree no longer ships, and ignoring them would
+// decode such a witness as an empty merkle one and replay it against nothing.
 func TestWitnessFromExtWitnessRejectsTwoDescriptions(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -163,6 +165,11 @@ func TestWitnessFromExtWitnessRejectsTwoDescriptions(t *testing.T) {
 			Keys:    []hexutil.Bytes{{0x00, 0x01}},
 			State:   []hexutil.Bytes{{0xaa}},
 			Proof:   hexutil.Bytes{0x03},
+		}},
+		{"keys without a proof", &ExtWitness{
+			Headers: []*types.Header{testHeader(1)},
+			Keys:    []hexutil.Bytes{{0x00, 0x01}},
+			State:   []hexutil.Bytes{{0xaa}},
 		}},
 		{"proof and state", &ExtWitness{
 			Headers: []*types.Header{testHeader(1)},

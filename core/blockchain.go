@@ -2329,6 +2329,13 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 	}
 	vtime := time.Since(vstart)
 
+	// A binary-tree witness carries a proof of the pre-state, which has to be
+	// built now: the requests are complete once the state changes have been
+	// applied, and the commit below overwrites the root they are proved against.
+	// A failure here is this node's, not a verdict on the block.
+	if err := statedb.BuildStateProof(); err != nil {
+		return nil, fmt.Errorf("failed to build the state proof: %w", err)
+	}
 	// If witnesses was generated and stateless self-validation requested, do
 	// that now. Self validation should *never* run in production, it's more of
 	// a tight integration to enable running *all* consensus tests through the

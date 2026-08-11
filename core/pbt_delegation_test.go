@@ -257,7 +257,7 @@ func TestPBTStatelessSetCodeTx(t *testing.T) {
 		t.Fatalf("processing the delegating block: %v", err)
 	}
 	witness := res.Witness()
-	if len(witness.Nodes) == 0 {
+	if len(witness.Proof) == 0 {
 		t.Fatal("the witness holds no nodes")
 	}
 

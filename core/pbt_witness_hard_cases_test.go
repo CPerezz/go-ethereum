@@ -20,7 +20,6 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/binary"
-	"maps"
 	"math/big"
 	"slices"
 	"testing"
@@ -140,28 +139,31 @@ func pbtWitnessedBlock(t *testing.T, genesis *Genesis, gen func(int, *BlockGen))
 		t.Fatalf("processing the block: %v", err)
 	}
 	witness := res.Witness()
-	if witness == nil || len(witness.Nodes) == 0 {
-		t.Fatal("the witness holds no nodes")
+	if witness == nil || len(witness.Proof) == 0 {
+		t.Fatal("the witness holds no proof")
 	}
 	return chain, blocks[0], witness
 }
 
 // assertPBTWitnessSufficient replays the block from the witness alone and
-// requires the state root to match. It then drops each node in turn and
-// requires the replay to be refused, which is what separates "the witness
-// happened to contain enough" from "nothing in it was spare".
+// requires the state root to match. It then truncates the proof at every length
+// and requires each one to be refused, which is what separates "the proof
+// happened to carry enough" from "none of it was spare".
 //
-// minNodes guards against the fixture quietly going trivial: a one-transaction
-// chain over a bare genesis folds into a single group record, and every
-// assertion below still passes over it. It says nothing about whether any
-// deletion ran - each caller pins that separately, by asserting on the state
-// the block was supposed to change.
-func assertPBTWitnessSufficient(t *testing.T, chain *BlockChain, block *types.Block, witness *stateless.Witness, minNodes int) {
+// Dropping one node at a time, which the node-set format allowed, has no
+// analogue: a proof is one blob, and the records a deletion enumerates on the
+// producer are genuinely spare on a consumer that never commits.
+//
+// minProof guards against the fixture quietly going trivial - a one-transaction
+// chain over a bare genesis proves a handful of bytes, and every assertion below
+// still passes over it. It says nothing about whether any deletion ran; each
+// caller pins that separately, by asserting on the state the block changed.
+func assertPBTWitnessSufficient(t *testing.T, chain *BlockChain, block *types.Block, witness *stateless.Witness, minProof int) {
 	t.Helper()
 
-	if len(witness.Nodes) < minNodes {
-		t.Fatalf("witness holds %d nodes, want at least %d: the fixture is too small to exercise anything",
-			len(witness.Nodes), minNodes)
+	if len(witness.Proof) < minProof {
+		t.Fatalf("witness proof is %d bytes, want at least %d: the fixture is too small to exercise anything",
+			len(witness.Proof), minProof)
 	}
 	header := types.CopyHeader(block.Header())
 	header.Root, header.ReceiptHash = common.Hash{}, common.Hash{}
@@ -177,13 +179,14 @@ func assertPBTWitnessSufficient(t *testing.T, chain *BlockChain, block *types.Bl
 	if testing.Short() {
 		return
 	}
-	for _, path := range slices.Sorted(maps.Keys(witness.Nodes)) {
+	for n := range len(witness.Proof) {
 		holed := witness.Copy()
-		delete(holed.Nodes, path)
+		holed.Proof = witness.Proof[:n]
 
 		root, _, err := ExecuteStateless(context.Background(), chain.Config(), vm.Config{}, task, holed)
 		if err == nil {
-			t.Fatalf("witness without the node at path %x still executed, returning root %x", path, root)
+			t.Fatalf("a proof truncated to %d of %d bytes still executed, returning root %x",
+				n, len(witness.Proof), root)
 		}
 	}
 }

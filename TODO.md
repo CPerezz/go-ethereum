@@ -3,20 +3,6 @@
 Known gaps in the EIP-8297 binary tree (PBT) work, recorded so they are not
 rediscovered by accident.
 
-## The witness could be a multiproof
-
-The witness ships the nodes a block resolved, which is the same shape as the
-per-stem group records: about 26 KB to witness a whole 24 KiB contract, but
-about 9 KB to witness reading one chunk of it, since a chunk now drags in its
-whole code-zone group. `trie/bintrie/multiproof.go` answers the same
-single-chunk read in 879 B, roughly ten times smaller, and real blocks read
-sparsely rather than densely.
-
-Swapping it in needs three things the node-set format does not: recording which
-keys a block touched, covering written stems whole (`insStem` refuses a write
-into a partially shipped stem), and the absence handling the multiproof already
-grew. `TestMultiproofSize` exists to measure the swap when it happens.
-
 ## One unwitnessed path to `stateObject.Code()`, and it cannot be reached
 
 `Witness.AddCode` is reached from `StateDB.GetCode` and `StateDB.GetCodeSize`,
@@ -68,7 +54,9 @@ integers.
 `code_size` in flat state would let both the read and the witness carry four
 bytes instead of the blob. It is not free: flat state persists
 `types.SlimAccount`, so this is a stored-format change requiring regeneration
-on every node.
+on every node. Note the flat reader is refused outright on a witness-backed
+database, so a stateless verifier never sees this path - the cost is the
+producer's.
 
 **Measure before deciding.** Build the adversarial block — many distinct large
 contracts, `EXTCODESIZE` only, nothing warm — and compare its witness size and
@@ -78,17 +66,19 @@ ratio decides whether the format change earns itself. Do not change
 a field the flat reader cannot fill arrives zero and would erase the size it
 was added to carry.
 
-## Witness statistics have no binary-aware histogram
+## Witness statistics have no input on the binary tree
 
 `--vmwitnessstats` is refused on the binary tree
-(`core/blockchain.go triedbConfig`) because `WitnessStats` reads a node's path
-as a nibble string and its depth as that string's length, bucketed into a fixed
-sixteen levels. A binary path is a two-byte bit count followed by packed bits,
-so the depth is wrong immediately and passes sixteen after 113 bits.
+(`core/blockchain.go triedbConfig`). The original reason was a histogram
+mismatch: `WitnessStats` reads a node's path as a nibble string and its depth as
+that string's length, bucketed into a fixed sixteen levels, while a binary path
+is a two-byte bit count followed by packed bits.
 
-Making it work needs the bit count read out of the path encoding and a
-histogram wider than `trie.LevelStats`'s fixed sixteen. Refusing only stops the
-crash.
+Widening the histogram would no longer be enough. The tree's witness is a proof
+now, and `WitnessStats` wants a node map, per-node paths and prefix containment -
+a proof has none of the three. Anything reported here would have to be defined
+over proof tokens instead, which is a different measurement rather than the same
+one made wider. The refusal and its test stay.
 
 ## Nothing ever reclaims a code-zone leaf
 

@@ -205,6 +205,15 @@ func (s *stateObject) GetCommittedState(key common.Hash) common.Hash {
 	}
 	s.db.StorageLoaded++
 
+	// One key, not the stem: replay answers this same call by walking the whole
+	// key through getValue, and a stem here would ship up to 256 slots per SLOAD.
+	// Slots below 64 live in the header stem, which the account read that
+	// necessarily preceded this one already covers whole.
+	//
+	// Guarded because StorageSlotKey hashes; see the account site.
+	if s.db.proofReqs != nil {
+		s.db.proofReqs.AddKey(bintrie.StorageSlotKey(s.address, key.Bytes()))
+	}
 	start := time.Now()
 	value, err := s.db.reader.Storage(s.address, key)
 	if err != nil {

@@ -236,6 +236,11 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 	if dbErr := work.state.Error(); dbErr != nil {
 		return &newPayloadResult{err: fmt.Errorf("%w: %v", errStateReadFailure, dbErr)}
 	}
+	// After the check above, not before: a latched read failure would otherwise
+	// surface as this proof's error and lose the classification.
+	if err := work.state.BuildStateProof(); err != nil {
+		return &newPayloadResult{err: fmt.Errorf("failed to build the state proof: %w", err)}
+	}
 	return &newPayloadResult{
 		block:    block,
 		fees:     totalFees(block, work.receipts),

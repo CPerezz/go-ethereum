@@ -83,7 +83,6 @@ func (w *Witness) FromExtWitness(ext *ExtWitness) error {
 	for _, node := range ext.State {
 		w.State[string(node)] = struct{}{}
 	}
-	w.Nodes = make(map[string][]byte)
 	return nil
 }
 

@@ -28,66 +28,38 @@ import (
 
 // toExtPBT fills the binary-tree half of ext and reports whether it applied.
 //
-// A proof and a node set are alternatives, so at most one of them is written and
-// the merkle fields are left to the caller when neither is.
+// State and Keys are allocated empty rather than left nil: they have no
+// omitempty, so a nil slice marshals to JSON null and every reader of
+// debug_executionWitness expecting an array breaks on it. RLP encodes nil and
+// empty alike, so the merkle byte-identity the Proof field preserves is
+// untouched either way.
 func (w *Witness) toExtPBT(ext *ExtWitness) bool {
-	if len(w.Proof) > 0 {
-		ext.Proof = slices.Clone(w.Proof)
-		return true
-	}
-	// A node set travels as parallel arrays ordered by path, because a group
-	// record folds at a depth stored inside it and cannot be re-keyed from its
-	// own bytes the way a merkle node can.
-	if len(w.Nodes) == 0 {
+	if len(w.Proof) == 0 {
 		return false
 	}
-	paths := make([]string, 0, len(w.Nodes))
-	for path := range w.Nodes {
-		paths = append(paths, path)
-	}
-	slices.Sort(paths)
-
-	ext.Keys = make([]hexutil.Bytes, 0, len(paths))
-	ext.State = make([]hexutil.Bytes, 0, len(paths))
-	for _, path := range paths {
-		ext.Keys = append(ext.Keys, []byte(path))
-		ext.State = append(ext.State, w.Nodes[path])
-	}
+	ext.Proof = slices.Clone(w.Proof)
+	ext.State = make([]hexutil.Bytes, 0)
+	ext.Keys = make([]hexutil.Bytes, 0)
 	return true
 }
 
 // fromExtPBT decodes the binary-tree half of ext and reports whether it applied.
 func (w *Witness) fromExtPBT(ext *ExtWitness) (bool, error) {
-	if len(ext.Proof) > 0 {
-		// A proof and a node set are two descriptions of one tree. Accepting both
-		// would leave the sender to decide which one the reader believed.
-		if len(ext.Keys) > 0 {
-			return false, fmt.Errorf("witness carries a %d-byte proof alongside %d path-keyed nodes", len(ext.Proof), len(ext.Keys))
-		}
-		if len(ext.State) > 0 {
-			return false, fmt.Errorf("witness carries a %d-byte proof alongside %d state nodes", len(ext.Proof), len(ext.State))
-		}
-		w.Proof = slices.Clone(ext.Proof)
-		w.Nodes = make(map[string][]byte)
-		w.State = make(map[string]struct{})
-		return true, nil
+	// Keys only ever carried the paths of a node set, which this tree no longer
+	// ships. Ignoring them would decode such a witness as an empty merkle one and
+	// replay it against nothing, so it is refused by name.
+	if len(ext.Keys) > 0 {
+		return false, fmt.Errorf("witness carries %d path-keyed nodes, which are no longer a witness format", len(ext.Keys))
 	}
-	// Keys present means a node set: State is path-addressed, and the two arrays
-	// must line up exactly, so a mismatch is rejected rather than silently
-	// truncated to the shorter one.
-	if len(ext.Keys) == 0 {
+	if len(ext.Proof) == 0 {
 		return false, nil
 	}
-	if len(ext.Keys) != len(ext.State) {
-		return false, fmt.Errorf("witness has %d keys for %d nodes", len(ext.Keys), len(ext.State))
+	// A proof and a merkle node set are two descriptions of one tree. Accepting
+	// both would leave the sender to decide which one the reader believed.
+	if len(ext.State) > 0 {
+		return false, fmt.Errorf("witness carries a %d-byte proof alongside %d state nodes", len(ext.Proof), len(ext.State))
 	}
-	w.Nodes = make(map[string][]byte, len(ext.Keys))
-	for i, path := range ext.Keys {
-		if _, dup := w.Nodes[string(path)]; dup {
-			return false, fmt.Errorf("witness repeats the node at path %x", []byte(path))
-		}
-		w.Nodes[string(path)] = ext.State[i]
-	}
+	w.Proof = slices.Clone(ext.Proof)
 	w.State = make(map[string]struct{})
 	return true, nil
 }

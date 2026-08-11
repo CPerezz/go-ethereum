@@ -19,9 +19,7 @@ package core
 import (
 	"bytes"
 	"context"
-	"maps"
 	"math/big"
-	"slices"
 	"strings"
 	"testing"
 
@@ -100,8 +98,8 @@ func pbtWitnessFixture(t *testing.T) (*BlockChain, *types.Block, *stateless.Witn
 	if witness == nil {
 		t.Fatal("no witness was gathered")
 	}
-	if len(witness.Nodes) == 0 {
-		t.Fatal("the binary tree witness holds no nodes; it cannot reconstruct anything")
+	if len(witness.Proof) == 0 {
+		t.Fatal("the binary tree witness holds no proof; it cannot reconstruct anything")
 	}
 	return chain, blocks[0], witness
 }
@@ -166,11 +164,11 @@ func TestPBTStatelessExecutionWithAccessList(t *testing.T) {
 	if receiptRoot != block.ReceiptHash() {
 		t.Fatalf("stateless receipt root mismatch: got %x, want %x", receiptRoot, block.ReceiptHash())
 	}
-	// The completeness check has to still fire with the list attached. Any
-	// single node will do; TestPBTStatelessRejectsIncompleteWitness proves
-	// exhaustively that every one of them is load-bearing.
+	// The completeness check has to still fire with the list attached.
+	// TestPBTStatelessRejectsIncompleteWitness proves exhaustively that no part of
+	// the proof is spare; here one truncation is enough.
 	holed := witness.Copy()
-	delete(holed.Nodes, slices.Sorted(maps.Keys(witness.Nodes))[0])
+	holed.Proof = witness.Proof[:len(witness.Proof)-1]
 	if root, _, err := ExecuteStateless(context.Background(), chain.Config(), vm.Config{}, task, holed); err == nil {
 		t.Fatalf("a holed witness still executed, returning root %x", root)
 	}
@@ -204,8 +202,8 @@ func TestPBTStatelessExecutionWithWrites(t *testing.T) {
 		t.Fatalf("processing the deploying block: %v", err)
 	}
 	witness := res.Witness()
-	if len(witness.Nodes) == 0 {
-		t.Fatal("the witness holds no nodes")
+	if len(witness.Proof) == 0 {
+		t.Fatal("the witness holds no proof")
 	}
 	// The deployed code is not in the witness and should not be: it is produced
 	// by running the init code, not read from state. What the witness owes is
@@ -281,7 +279,7 @@ func TestPBTStatelessContractCoinbase(t *testing.T) {
 		t.Fatalf("processing the block: %v", err)
 	}
 	witness := res.Witness()
-	if witness == nil || len(witness.Nodes) == 0 {
+	if witness == nil || len(witness.Proof) == 0 {
 		t.Fatal("the witness holds no nodes")
 	}
 	header := types.CopyHeader(blocks[0].Header())
@@ -332,20 +330,30 @@ func TestPBTStatelessRejectsIncompleteWitness(t *testing.T) {
 	header.Root, header.ReceiptHash = common.Hash{}, common.Hash{}
 	task := types.NewBlockWithHeader(header).WithBody(*block.Body())
 
-	// Drop nodes one at a time; every one of them is reachable during the
-	// re-execution, so each omission has to be caught.
-	paths := slices.Sorted(maps.Keys(witness.Nodes))
-	for _, path := range paths {
+	// Truncate the proof at every length. A proof is one blob rather than a set of
+	// nodes, so shortening it is the analogue of dropping one: every prefix either
+	// fails to decode, rebuilds a tree that does not fold to the claimed root, or
+	// leaves a read unanswered.
+	for n := range len(witness.Proof) {
 		holed := witness.Copy()
-		delete(holed.Nodes, path)
+		holed.Proof = witness.Proof[:n]
 
 		root, _, err := ExecuteStateless(context.Background(), chain.Config(), vm.Config{}, task, holed)
 		if err == nil {
-			t.Fatalf("witness without the node at path %x still executed, returning root %x", path, root)
+			t.Fatalf("a proof truncated to %d of %d bytes still executed, returning root %x",
+				n, len(witness.Proof), root)
 		}
 		if root != (common.Hash{}) {
 			t.Fatalf("a rejected witness still produced a root: %x", root)
 		}
+	}
+	// A proof for another root has to be refused before execution rather than
+	// during it: it describes a whole tree, consistently, just not this one.
+	wrong := witness.Copy()
+	wrong.Headers[0] = types.CopyHeader(wrong.Headers[0])
+	wrong.Headers[0].Root = common.Hash{0xbb}
+	if _, _, err := ExecuteStateless(context.Background(), chain.Config(), vm.Config{}, task, wrong); err == nil {
+		t.Fatal("a proof over another root was accepted")
 	}
 }
 
@@ -353,11 +361,10 @@ func TestPBTStatelessRejectsIncompleteWitness(t *testing.T) {
 // consensus encoding, which is the form debug_executionWitness hands out and
 // the form anything off-process would receive.
 //
-// The paths are the part at risk. A merkle witness is a bag of blobs and needs
-// no keys, so the key array went unused and unwritten; a binary witness is
-// meaningless without it, and a decoder that dropped or misaligned it would
-// produce a witness that still looks well-formed and rebuilds into the wrong
-// tree.
+// The proof is the part at risk. It rides a field upstream does not have, added
+// as an optional tail so a merkle witness keeps its byte-for-byte encoding, and a
+// decoder that dropped it would produce a witness that still looks well-formed
+// and carries no state at all.
 func TestPBTWitnessSurvivesEncoding(t *testing.T) {
 	chain, block, witness := pbtWitnessFixture(t)
 
@@ -369,21 +376,11 @@ func TestPBTWitnessSurvivesEncoding(t *testing.T) {
 	if err := rlp.DecodeBytes(buf.Bytes(), decoded); err != nil {
 		t.Fatalf("decoding a binary tree witness: %v", err)
 	}
-	if len(decoded.Nodes) != len(witness.Nodes) {
-		t.Fatalf("round trip changed the node count: %d -> %d", len(witness.Nodes), len(decoded.Nodes))
+	if !bytes.Equal(decoded.Proof, witness.Proof) {
+		t.Fatalf("round trip changed the proof: %d bytes in, %d out", len(witness.Proof), len(decoded.Proof))
 	}
-	for path, want := range witness.Nodes {
-		got, ok := decoded.Nodes[path]
-		if !ok {
-			t.Fatalf("round trip lost the node at path %x", path)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("path %x: node changed across the round trip", path)
-		}
-	}
-	// The real assertion: the decoded witness still reconstructs the state.
-	// Matching maps would not catch paths that survive but no longer address
-	// what they did.
+	// The real assertion: the decoded witness still reconstructs the state. Equal
+	// bytes would not catch a proof that survives but is no longer reachable.
 	header := types.CopyHeader(block.Header())
 	header.Root, header.ReceiptHash = common.Hash{}, common.Hash{}
 	task := types.NewBlockWithHeader(header).WithBody(*block.Body())

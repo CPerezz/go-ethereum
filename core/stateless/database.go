@@ -70,13 +70,13 @@ func (w *Witness) MakeHashDB() ethdb.Database {
 	return memdb
 }
 
-// MakePathDB imports nodes, codes and block hashes from a binary-tree witness
+// MakePathDB imports a proof, codes and block hashes from a binary-tree witness
 // into a new path-based memory db.
 //
 // The binary tree cannot use MakeHashDB. A merkle node is named by the hash of
 // its own bytes, so a bag of blobs is a complete description; a binary group
 // record folds at a depth stored inside it, so its hash depends on where it
-// sits and the blob alone cannot be re-keyed. Nodes are therefore addressed by
+// sits and the blob alone cannot be re-keyed. Records are therefore addressed by
 // path here, which is what pathdb wants anyway.
 //
 // Headers and codes are still keyed by hash and so validate themselves. State
@@ -118,8 +118,8 @@ func (w *Witness) MakePathDB() (ethdb.Database, error) {
 	return memdb, nil
 }
 
-// writeStateRecords fills the state records from the witness: out of its proof
-// where it carries one, otherwise out of the node set it shipped.
+// writeStateRecords verifies the witness's proof and writes out the records the
+// tree it rebuilds is made of.
 func (w *Witness) writeStateRecords(tbl ethdb.Database) error {
 	root := w.Root()
 	// Both sentinels denote a fresh tree, which trie.NewReader answers without
@@ -133,15 +133,10 @@ func (w *Witness) writeStateRecords(tbl ethdb.Database) error {
 		return w.writeProofRecords(tbl, root)
 	case blank:
 		return nil
-	case len(w.Nodes) > 0:
-		for path, blob := range w.Nodes {
-			rawdb.WriteAccountTrieNode(tbl, []byte(path), blob)
-		}
-		return nil
 	}
 	// Silent otherwise: every read would miss, the block would be refused on its
 	// root, and the producer would look at fault instead of its own witness.
-	return fmt.Errorf("stateless: witness for root %x carries no state", root)
+	return fmt.Errorf("stateless: witness for root %x carries no proof", root)
 }
 
 // writeProofRecords verifies the proof against root and writes the tree it

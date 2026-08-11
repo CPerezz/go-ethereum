@@ -144,6 +144,11 @@ type StateDB struct {
 	// State witness if cross validation is needed
 	witness *stateless.Witness
 
+	// proofReqs accumulates what the block's proof has to cover, and is the latch
+	// for proof-shaped witnesses: non-nil exactly when a binary-tree witness is
+	// being collected.
+	proofReqs *bintrie.ProofRecorder
+
 	// Measurements gathered during execution for debugging purposes
 	AccountReads   time.Duration
 	AccountHashes  time.Duration
@@ -210,6 +215,13 @@ func (s *StateDB) StartPrefetcher(namespace string, witness *stateless.Witness) 
 
 	// Enable witness collection if requested
 	s.witness = witness
+
+	// A binary-tree witness ships a proof, which has to be built over the
+	// pre-state from what the block covered rather than from the nodes execution
+	// happened to resolve.
+	if witness != nil && s.db.Type().Is(TypePBT) {
+		s.proofReqs = bintrie.NewProofRecorder()
+	}
 
 	// With the switch to the Proof-of-Stake consensus algorithm, block production
 	// rewards are now handled at the consensus layer. Consequently, a block may
@@ -407,6 +419,10 @@ func (s *StateDB) HasStorage(addr common.Address) bool {
 		s.setError(fmt.Errorf("expected a binary trie, got %T", tr))
 		return false
 	}
+	// This trie is thrown away, so without the recorder the prefix walk below is
+	// the one resolve in the block whose nodes no proof would name.
+	bt.SetProofRecorder(s.proofReqs)
+
 	has, err := bt.HasHeaderStorage(addr)
 	if err != nil {
 		s.setError(err)
@@ -745,6 +761,17 @@ func (s *StateDB) getStateObject(addr common.Address) *stateObject {
 	}
 	s.AccountLoaded++
 
+	// Recorded here rather than in the trie, and before the read: the flat reader
+	// answers most of these without touching the tree, and a read that errors
+	// still owes the proof the node it could not reach. A whole stem, because
+	// replay answers this same call through getStemGroup, which refuses a group it
+	// holds only part of.
+	//
+	// Guarded because HeaderStem hashes: unguarded this would cost a blake3 on
+	// every merkle account read as well.
+	if s.proofReqs != nil {
+		s.proofReqs.AddStem(bintrie.HeaderStem(addr))
+	}
 	start := time.Now()
 	acct, err := s.reader.Account(addr)
 	if err != nil {
@@ -852,6 +879,12 @@ func (s *StateDB) Copy() *StateDB {
 		accessList:       s.accessList.Copy(),
 		transientStorage: s.transientStorage.Copy(),
 		journal:          s.journal.copy(),
+
+		// Aliased rather than copied, matching BinaryTrie.Copy: one proof covers the
+		// block, so a copy filling its own set would leave the owner's short. No
+		// production path copies a witness-bearing statedb, and if one did, sharing
+		// over-records the parent's proof - a superset still verifies.
+		proofReqs: s.proofReqs,
 	}
 	if s.trie != nil {
 		state.trie = mustCopyTrie(s.trie)
@@ -1096,6 +1129,14 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.trie = tr
 		}
 	}
+	// Outside the block above, so it covers a trie that arrived by any route -
+	// adopted from the prefetcher, opened here, or carried over by Copy - and so
+	// a second IntermediateRoot re-attaches rather than skipping.
+	if s.proofReqs != nil {
+		if bt, ok := s.trie.(*bintrie.BinaryTrie); ok {
+			bt.SetProofRecorder(s.proofReqs)
+		}
+	}
 	// Process all storage updates concurrently. The state object update root
 	// method will internally call a blocking trie fetch from the prefetcher,
 	// so there's no need to explicitly wait for the prefetchers to finish.
@@ -1278,14 +1319,10 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	hash := s.trie.Hash()
 
 	// If witness building is enabled, gather the trie witness. The binary tree
-	// keeps the paths its nodes were resolved at, because a group record is
-	// not its own hash preimage and cannot be re-keyed from its bytes.
-	if s.witness != nil {
-		if s.db.Type().Is(TypePBT) {
-			s.witness.AddNodes(s.trie.Witness())
-		} else {
-			s.witness.AddState(s.trie.Witness(), common.Hash{})
-		}
+	// does not: its witness is a proof over what the block covered, built by
+	// BuildStateProof once the state changes have been applied.
+	if s.witness != nil && !s.db.Type().Is(TypePBT) {
+		s.witness.AddState(s.trie.Witness(), common.Hash{})
 	}
 	return hash
 }
@@ -1802,4 +1839,62 @@ func (s *StateDB) markUpdate(addr common.Address) {
 // Witness retrieves the current state witness being collected.
 func (s *StateDB) Witness() *stateless.Witness {
 	return s.witness
+}
+
+// BuildStateProof proves the pre-state over everything the block covered and
+// attaches the result to the witness.
+//
+// It must run after the block's state changes have been applied and before the
+// commit: the requests are accumulated during execution, and Commit overwrites
+// originalRoot with the post-state root.
+//
+// The first two checks return rather than complain. Both call sites run
+// unconditionally, and a merkle chain collecting a witness is the ordinary case.
+func (s *StateDB) BuildStateProof() error {
+	if s.witness == nil || !s.db.Type().Is(TypePBT) {
+		return nil
+	}
+	if len(s.witness.Proof) > 0 {
+		return nil // already built; proving again is a wasted walk of the tree
+	}
+	if s.proofReqs == nil {
+		return errors.New("no proof requests were recorded")
+	}
+	// A latched read error means the request set is short by whatever the failed
+	// read would have asked for, so the proof would be built over the wrong cover.
+	if s.dbErr != nil {
+		return fmt.Errorf("state read failed before the proof: %w", s.dbErr)
+	}
+	// Before Root(), which indexes Headers without checking it is non-empty.
+	if len(s.witness.Headers) == 0 {
+		return errors.New("witness carries no headers, so it has no pre-state root")
+	}
+	if root := s.witness.Root(); root != s.originalRoot {
+		return fmt.Errorf("witness root %x is not the pre-state root %x", root, s.originalRoot)
+	}
+	// Both sentinels denote a tree with nothing in it, which cannot be proved: the
+	// walk emits no token, and the consumer reads a fresh tree without asking the
+	// database. Anything else has to produce bytes.
+	if s.originalRoot == types.EmptyBinaryHash || s.originalRoot == types.EmptyRootHash {
+		return nil
+	}
+	// A fresh trie, because s.trie now holds the post-state.
+	tr, err := s.db.OpenTrie(s.originalRoot)
+	if err != nil {
+		return err
+	}
+	bt, ok := tr.(*bintrie.BinaryTrie)
+	if !ok {
+		return fmt.Errorf("expected a binary trie, got %T", tr)
+	}
+	mp, err := bt.ProveRequests(s.proofReqs.Requests())
+	if err != nil {
+		return err
+	}
+	blob := mp.Encode()
+	if len(blob) == 0 {
+		return fmt.Errorf("proof over %d requests encoded to nothing", s.proofReqs.Len())
+	}
+	s.witness.AddProof(blob)
+	return nil
 }

@@ -42,23 +42,14 @@ type Witness struct {
 	Codes   map[string]struct{} // Set of bytecodes ran or accessed
 	State   map[string]struct{} // Set of MPT state trie nodes (account and storage together)
 
-	// Nodes holds binary-tree nodes keyed by their path, and is used instead
-	// of State when the chain commits to the binary tree.
+	// Proof is the encoded binary-tree multiproof over the pre-state root, and is
+	// what the binary tree carries instead of State.
 	//
-	// The distinction is forced by how the two trees are addressed. A merkle
-	// node is named by the hash of its own bytes, so a set of blobs is a
-	// complete description and MakeHashDB can re-derive every key. A binary
-	// group record is not its own preimage - it folds at the depth stored
-	// inside it - so it is addressed by path, and dropping the path loses the
-	// only thing that can find it again.
-	Nodes map[string][]byte
-
-	// Proof is the encoded binary-tree multiproof over the pre-state root, and
-	// replaces Nodes on the wire where it is set.
-	//
-	// The difference is what each one is worth to a verifier. A node set is only
-	// as complete as the builder happened to be, and nothing in it says so; a
-	// proof either recomputes the root it claims or is refused.
+	// It is a proof rather than a set of nodes because of what each is worth to a
+	// verifier. A node set is only as complete as the builder happened to be, and
+	// nothing in it says so; a proof either recomputes the root it claims or is
+	// refused. It is also far smaller, since a proof covers the keys the block
+	// touched while a node set ships every group record they sat in.
 	Proof []byte
 
 	chain HeaderReader  // Chain reader to convert block hash ops to header proofs
@@ -84,7 +75,6 @@ func NewWitness(context *types.Header, chain HeaderReader, enableStats bool) (*W
 		Headers: headers,
 		Codes:   make(map[string]struct{}),
 		State:   make(map[string]struct{}),
-		Nodes:   make(map[string][]byte),
 		chain:   chain,
 	}
 	if enableStats {
@@ -139,30 +129,6 @@ func (w *Witness) ReportMetrics(blockNumber uint64) {
 	w.stats.ReportMetrics(blockNumber)
 }
 
-// AddNodes inserts a batch of binary-tree nodes into the witness, keyed by
-// their path.
-//
-// This is the binary-tree counterpart of AddState. It keeps the paths because
-// a binary group record cannot be re-keyed from its bytes: the record folds at
-// a depth stored inside it, so its hash is a function of where it sits rather
-// than of what it contains.
-//
-// Statistics are deliberately not collected here. WitnessStats reads a path as
-// a nibble string and its depth as the path's length, neither of which holds
-// for the bit-count-prefixed paths this tree uses; feeding it one indexes past
-// the end of a fixed 16-level histogram.
-func (w *Witness) AddNodes(nodes map[string][]byte) {
-	if len(nodes) == 0 {
-		return
-	}
-	w.lock.Lock()
-	defer w.lock.Unlock()
-
-	for path, value := range nodes {
-		w.Nodes[path] = value
-	}
-}
-
 // AddProof attaches the encoded binary-tree multiproof over the pre-state root.
 //
 // An empty proof is dropped rather than stored, so that absent and
@@ -186,7 +152,6 @@ func (w *Witness) Copy() *Witness {
 		Headers: slices.Clone(w.Headers),
 		Codes:   maps.Clone(w.Codes),
 		State:   maps.Clone(w.State),
-		Nodes:   maps.Clone(w.Nodes),
 		Proof:   slices.Clone(w.Proof),
 		chain:   w.chain,
 	}
