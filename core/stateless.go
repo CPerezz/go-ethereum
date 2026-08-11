@@ -61,18 +61,20 @@ func ExecuteStateless(ctx context.Context, config *params.ChainConfig, vmconfig 
 	// Create and populate the state database to serve as the stateless backend.
 	//
 	// The two trees are rebuilt differently because they are addressed
-	// differently: a merkle node is named by the hash of its own bytes and can
-	// be re-keyed from a bag of blobs, a binary group record folds at a depth
-	// stored inside it and has to keep the path it was resolved at. Picking the
-	// wrong one does not fail loudly - it produces a root that cannot match,
-	// and the caller rejects its own valid block - so the scheme follows the
-	// chain config rather than being inferred from the witness.
+	// differently: a merkle node is named by the hash of its own bytes and can be
+	// re-keyed from a bag of blobs, a binary group record folds at a depth stored
+	// inside it and has to keep the path it was resolved at. The scheme follows
+	// the chain config rather than being inferred from the witness.
 	var (
 		memdb   ethdb.Database
 		tdbconf *triedb.Config
+		err     error
 	)
 	if config.IsPBT() {
-		memdb, tdbconf = witness.MakePathDB(), triedb.PBTWitnessDefaults
+		tdbconf = triedb.PBTWitnessDefaults
+		if memdb, err = witness.MakePathDB(); err != nil {
+			return common.Hash{}, common.Hash{}, err
+		}
 	} else {
 		memdb, tdbconf = witness.MakeHashDB(), triedb.HashDefaults
 	}
