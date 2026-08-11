@@ -18,6 +18,7 @@ package stateless
 
 import (
 	"bytes"
+	"encoding/json"
 	"math/big"
 	"testing"
 
@@ -218,5 +219,40 @@ func checkBytes(t *testing.T, name string, got []hexutil.Bytes, want [][]byte) {
 		if !bytes.Equal(got[i], want[i]) {
 			t.Fatalf("%s %d mismatch: have %x, want %x", name, i, got[i], want[i])
 		}
+	}
+}
+
+// TestWitnessProofJSONShape pins that a binary-tree witness marshals its empty
+// merkle fields as arrays rather than null.
+//
+// debug_executionWitness hands ExtWitness out as JSON, so this is the shape
+// external readers see. State and Keys have no omitempty, and a nil slice
+// marshals to null: every reader that walks them as arrays would break on a
+// binary-tree response, which is why toExtPBT allocates them empty. RLP treats
+// nil and empty alike, so the merkle byte-identity is unaffected either way.
+func TestWitnessProofJSONShape(t *testing.T) {
+	w := &Witness{Headers: []*types.Header{testHeader(1)}}
+	w.AddProof([]byte{0x03, 0x21, 0xaa})
+
+	blob, err := json.Marshal(w.ToExtWitness())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		State *[]hexutil.Bytes `json:"state"`
+		Keys  *[]hexutil.Bytes `json:"keys"`
+		Proof hexutil.Bytes    `json:"proof"`
+	}
+	if err := json.Unmarshal(blob, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State == nil || got.Keys == nil {
+		t.Fatalf("a proof witness marshalled state or keys as null: %s", blob)
+	}
+	if len(*got.State) != 0 || len(*got.Keys) != 0 {
+		t.Fatalf("a proof witness carried merkle fields: %s", blob)
+	}
+	if len(got.Proof) == 0 {
+		t.Fatalf("the proof did not survive the JSON encoding: %s", blob)
 	}
 }
