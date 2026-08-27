@@ -536,3 +536,40 @@ func (api *DebugAPI) ClearTxpool() error {
 	api.eth.TxPool().Clear()
 	return nil
 }
+
+// PBTMigrationStatusResult is the wire shape of debug_pbtMigrationStatus.
+// The field names and the phase strings are FROZEN: the devnet monitor keys
+// on them, so renaming one is a breaking API change. shadowRoot joins the
+// shape once the shadow replayer exists; migrationPost may gain fields
+// additively, never renames.
+type PBTMigrationStatusResult struct {
+	Phase          string          `json:"phase"`
+	HeadNumber     hexutil.Uint64  `json:"headNumber"`
+	HeadTimestamp  hexutil.Uint64  `json:"headTimestamp"`
+	BinaryTrieTime *hexutil.Uint64 `json:"binaryTrieTime"`
+	CanonicalRoot  common.Hash     `json:"canonicalRoot"`
+}
+
+// PbtMigrationStatus reports where this node stands relative to the binary
+// tree fork: the phase, the head it is judged at, the schedule, and the root
+// the canonical tree commits there. This is the observability floor of the
+// EIP-8347 migration — enough for a monitor to assert that every node flips
+// phase at the same block — and grows a shadow root once the shadow
+// replayer exists.
+func (api *DebugAPI) PbtMigrationStatus() PBTMigrationStatusResult {
+	var (
+		head = api.eth.blockchain.CurrentBlock()
+		cfg  = api.eth.blockchain.Config()
+	)
+	res := PBTMigrationStatusResult{
+		Phase:         api.eth.blockchain.PBTMode().String(),
+		HeadNumber:    hexutil.Uint64(head.Number.Uint64()),
+		HeadTimestamp: hexutil.Uint64(head.Time),
+		CanonicalRoot: head.Root,
+	}
+	if cfg.BinaryTrieTime != nil {
+		t := hexutil.Uint64(*cfg.BinaryTrieTime)
+		res.BinaryTrieTime = &t
+	}
+	return res
+}
