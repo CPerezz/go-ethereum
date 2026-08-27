@@ -457,6 +457,13 @@ func (bc *BlockChain) Config() *params.ChainConfig { return bc.chainConfig }
 // open time; see pbt_mode.go.
 func (bc *BlockChain) PBTMode() PBTMode { return bc.pbtMode }
 
+// ShadowTrieDB returns the NON-canonical tree's database during the
+// transition window: the binary tree before the switchover (the replayer's
+// working surface), the merkle trie during the post-switchover window until
+// finality (future work); nil outside a transition. In this build it is
+// non-nil only in migration-pre.
+func (bc *BlockChain) ShadowTrieDB() *triedb.Database { return bc.shadowTriedb }
+
 // Engine retrieves the blockchain's consensus engine.
 func (bc *BlockChain) Engine() consensus.Engine { return bc.engine }
 

@@ -400,6 +400,13 @@ type BlockChain struct {
 	// at open time (see pbt_mode.go). It never changes while the chain is
 	// open: crossing the fork live is refused until the switchover exists.
 	pbtMode PBTMode
+
+	// shadowTriedb is the NON-canonical tree's database during the
+	// transition window: the binary tree before the switchover (the
+	// replayer's working surface), the merkle trie during the
+	// post-switchover window until finality (future work). Nil outside a
+	// transition; in this build it is non-nil only in migration-pre.
+	shadowTriedb *triedb.Database
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -435,6 +442,29 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	if err != nil {
 		return nil, err
 	}
+	// In migration-pre the binary tree rides shotgun: canonical state is
+	// merkle, and the imported shadow opens read-write for the replayer to
+	// advance. Opened eagerly — pathdb checks the flat-state attestation at
+	// open, and a corrupt shadow should stop the node here, where the
+	// operator is, not at first replay. The shadow inherits the node's
+	// history settings unchanged: rollback never relies on history (rewind
+	// is diff-layer discard, per EIP-8347's discard-not-reverse rule), so
+	// the setting only bounds the freezer's retention.
+	//
+	// Storage stays in the shared key-value store under the binary tree's
+	// own namespace — the layout a from-genesis tree node already has, so
+	// crossing the fork moves nothing. If dual-write compaction pressure or
+	// cache contention ever bites at scale, the lever is pebble tuning, not
+	// a second database directory: total IO is the same either way, and a
+	// side directory would either survive the fork as a permanently
+	// divergent layout or demand a bulk migration at the worst moment.
+	var shadowTriedb *triedb.Database
+	if mode == PBTModeMigrationPre {
+		shadowTriedb = triedb.NewDatabase(db, &triedb.Config{
+			IsPBT:  true,
+			PathDB: tdbConfig.PathDB,
+		})
+	}
 	triedb := triedb.NewDatabase(db, tdbConfig)
 
 	// Write the supplied genesis to the database if it has not been initialized
@@ -457,6 +487,7 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		chainConfig:        chainConfig,
 		pbtMode:            mode,
 		cfg:                cfg,
+		shadowTriedb:       shadowTriedb,
 		db:                 db,
 		triedb:             triedb,
 		codedb:             state.NewCodeDB(db),
@@ -1472,6 +1503,13 @@ func (bc *BlockChain) Stop() {
 	// Close the trie database, release all the held resources as the last step.
 	if err := bc.triedb.Close(); err != nil {
 		log.Error("Failed to close trie database", "err", err)
+	}
+	// The shadow follows: it holds no unjournaled layers of its own until
+	// the replayer exists, so closing is releasing.
+	if bc.shadowTriedb != nil {
+		if err := bc.shadowTriedb.Close(); err != nil {
+			log.Error("Failed to close shadow trie database", "err", err)
+		}
 	}
 	log.Info("Blockchain stopped")
 }

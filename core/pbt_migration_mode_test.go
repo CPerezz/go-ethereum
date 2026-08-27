@@ -206,6 +206,9 @@ func TestMigrationModeGuards(t *testing.T) {
 		if chain.TrieDB().IsPBT() {
 			t.Fatal("migration-pre opened the binary tree as canonical; the merkle trie is")
 		}
+		if shadow := chain.ShadowTrieDB(); shadow == nil || !shadow.IsPBT() {
+			t.Fatal("migration-pre opened without its shadow binary tree")
+		}
 		if head := chain.CurrentBlock(); head.Number.Uint64() != 0 {
 			t.Fatalf("head is block %d, want the genesis", head.Number)
 		}
