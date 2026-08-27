@@ -470,9 +470,15 @@ func (g *Genesis) chainConfigOrDefault(ghash common.Hash, stored *params.ChainCo
 	}
 }
 
-// IsPBT indicates whether the state is committed with a binary tree.
+// IsPBT indicates whether the state of THIS genesis is committed with a
+// binary tree. The question is positional, not "is the fork scheduled": a
+// chain that schedules the tree after its genesis timestamp starts on the
+// merkle-patricia trie and migrates later (EIP-8347), and every caller here
+// is deciding how to hash or store block zero specifically. The
+// schedule-at-all question stays with ChainConfig.IsPBT. Conflating the two
+// is what used to make a future binaryTrieTime commit a binary-tree genesis.
 func (g *Genesis) IsPBT() bool {
-	return g.Config != nil && g.Config.IsPBT()
+	return g.Config != nil && g.Config.PBTActive(common.Big0, g.Timestamp)
 }
 
 // ToBlock returns the genesis block according to genesis specification.
