@@ -422,7 +422,7 @@ func (bc *BlockChain) State() (*state.StateDB, error) {
 
 // StateAt returns a new mutable state based on a particular point in time.
 func (bc *BlockChain) StateAt(header *types.Header) (*state.StateDB, error) {
-	if bc.chainConfig.IsPBT() {
+	if bc.pbtMode.canonicalPBT() {
 		return state.New(header.Root, state.NewPBTDatabase(bc.triedb, bc.codedb))
 	}
 	return state.New(header.Root, state.NewMPTDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps))
@@ -435,7 +435,7 @@ func (bc *BlockChain) HistoricState(header *types.Header) (*state.StateDB, error
 	// The historic database opens merkle-patricia tries keyed by the hash of
 	// the address, which the binary tree is not. Only reconstruction is out of
 	// reach; live state is still served by State and StateAt.
-	if bc.chainConfig.IsPBT() {
+	if bc.pbtMode.canonicalPBT() {
 		return nil, errors.New("historical state is not supported for the binary tree")
 	}
 	return state.New(header.Root, state.NewHistoricDatabase(bc.triedb, bc.codedb))
@@ -443,6 +443,11 @@ func (bc *BlockChain) HistoricState(header *types.Header) (*state.StateDB, error
 
 // Config retrieves the chain's fork configuration.
 func (bc *BlockChain) Config() *params.ChainConfig { return bc.chainConfig }
+
+// PBTMode reports which tree carries the canonical state commitment and
+// where the chain stands relative to the binary tree fork. Resolved once at
+// open time; see pbt_mode.go.
+func (bc *BlockChain) PBTMode() PBTMode { return bc.pbtMode }
 
 // Engine retrieves the blockchain's consensus engine.
 func (bc *BlockChain) Engine() consensus.Engine { return bc.engine }

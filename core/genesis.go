@@ -616,27 +616,6 @@ func (g *Genesis) MustCommit(db ethdb.Database, triedb *triedb.Database) *types.
 	return block
 }
 
-// pbtEnabled reports whether the chain commits its state with the binary tree,
-// taking the answer from the supplied genesis or, failing that, from the config
-// already stored on disk.
-//
-// It runs before the trie database exists, so it cannot ask one; that is also
-// why the commitment has to be answerable without a block.
-func pbtEnabled(db ethdb.Database, genesis *Genesis) (bool, error) {
-	if genesis != nil {
-		if genesis.Config == nil {
-			return false, errGenesisNoConfig
-		}
-		return genesis.Config.IsPBT(), nil
-	}
-	if ghash := rawdb.ReadCanonicalHash(db, 0); ghash != (common.Hash{}) {
-		if chainCfg := rawdb.ReadChainConfig(db, ghash); chainCfg != nil {
-			return chainCfg.IsPBT(), nil
-		}
-	}
-	return false, nil
-}
-
 // DefaultGenesisBlock returns the Ethereum main net genesis block.
 func DefaultGenesisBlock() *Genesis {
 	return &Genesis{

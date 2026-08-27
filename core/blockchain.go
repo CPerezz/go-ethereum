@@ -395,6 +395,11 @@ type BlockChain struct {
 
 	lastForkReadyAlert time.Time     // Last time there was a fork readiness print out
 	slowBlockThreshold time.Duration // Block execution time threshold beyond which detailed statistics will be logged
+
+	// pbtMode places this chain against the binary tree fork, resolved once
+	// at open time (see pbt_mode.go). It never changes while the chain is
+	// open: crossing the fork live is refused until the switchover exists.
+	pbtMode PBTMode
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -405,18 +410,28 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		cfg = DefaultConfig()
 	}
 
-	// Open trie database with provided config
-	isPBT, err := pbtEnabled(db, genesis)
+	// Resolve which tree is canonical before anything opens, and hold the
+	// on-disk markers to it. The mode is decided from configuration and
+	// headers alone: state has not been opened yet, and cannot be until the
+	// mode says how.
+	mode, headHeader, err := pbtMode(db, genesis)
 	if err != nil {
 		return nil, err
 	}
-	// A binary tree database must never be reopened as merkle: a stored config
-	// that lost the fork (e.g. written when the key was "pbt") would silently
-	// point the node at an empty merkle namespace.
-	if !isPBT && rawdb.HasPBTState(db) {
-		return nil, errors.New("database holds binary tree state but the chain configuration does not schedule it (the genesis config key is \"binaryTrieTime\"); re-run init with an updated genesis, or resync")
+	if err := checkPBTMode(db, mode, headHeader); err != nil {
+		return nil, err
 	}
-	tdbConfig, err := cfg.triedbConfig(isPBT)
+	// The shadow tree lives in pathdb, so a migration is path-scheme only —
+	// better refused at first boot, where the operator is, than discovered
+	// at the fork.
+	if mode == PBTModeMigrationPre && cfg.StateScheme != rawdb.PathScheme {
+		scheme := cfg.StateScheme
+		if scheme == "" {
+			scheme = "unset"
+		}
+		return nil, fmt.Errorf("migration mode requires the path state scheme (--state.scheme=path), configured scheme is %s", scheme)
+	}
+	tdbConfig, err := cfg.triedbConfig(mode.canonicalPBT())
 	if err != nil {
 		return nil, err
 	}
@@ -440,6 +455,7 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 
 	bc := &BlockChain{
 		chainConfig:        chainConfig,
+		pbtMode:            mode,
 		cfg:                cfg,
 		db:                 db,
 		triedb:             triedb,
@@ -1987,6 +2003,14 @@ func (bc *BlockChain) insertChain(ctx context.Context, chain types.Blocks, setHe
 			log.Debug("Abort during block processing")
 			break
 		}
+		// A migrating node cannot cross binaryTrieTime yet: switchover
+		// execution does not exist, and executing the boundary block against
+		// the merkle trie would commit the wrong root. Stall loudly instead;
+		// the switchover work replaces exactly this check.
+		if bc.pbtMode == PBTModeMigrationPre && block.Time() >= *bc.chainConfig.BinaryTrieTime {
+			return witness, it.index, fmt.Errorf("%w: block %d (time %d) reaches binaryTrieTime %d",
+				errPBTSwitchoverNotImplemented, block.NumberU64(), block.Time(), *bc.chainConfig.BinaryTrieTime)
+		}
 		// If the block is known (in the middle of the chain), it's a special case for
 		// Clique blocks where they can share state among each other, so importing an
 		// older block might complete the state of the subsequent one. In this case,
@@ -2179,7 +2203,7 @@ func (bc *BlockChain) setupExecutionState(parentRoot common.Hash, block *types.B
 	noop := func(*blockProcessingResult) {}
 
 	var sdb state.Database
-	if bc.chainConfig.IsPBT() {
+	if bc.pbtMode.canonicalPBT() {
 		sdb = state.NewPBTDatabase(bc.triedb, bc.codedb)
 	} else {
 		sdb = state.NewMPTDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps)

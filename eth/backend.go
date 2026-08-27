@@ -295,6 +295,15 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The binary tree refuses snap sync, and a migration doubly so: the
+	// shadow tree is seeded by an offline import and advanced by replay,
+	// neither of which snap sync preserves. Refused at boot, where the
+	// operator is, rather than discovered at the fork.
+	if mode := eth.blockchain.PBTMode(); mode == core.PBTModeMigrationPre || mode == core.PBTModeMigrationPost {
+		if config.SyncMode == ethconfig.SnapSync {
+			return nil, fmt.Errorf("migration mode (binaryTrieTime scheduled after genesis) requires --syncmode=full")
+		}
+	}
 
 	// Initialize filtermaps log index.
 	fmConfig := filtermaps.Config{
