@@ -221,10 +221,23 @@ to look.
   for, so this costs bytes rather than soundness.
 - **BAL-replay catch-up is unimplemented.** `geth bintrie convert` produces
   the EIP-8347 artifacts and `geth bintrie import` consumes them - dual-check
-  verified, anchored to the local header chain. What remains of the migration
-  lifecycle is advancing an imported anchor to the tip by replaying
-  Block-Level Access Lists, plus re-anchoring and reorg handling: networking
-  workstreams with no importer dependency.
+  verified, anchored to the local header chain (convert now records its
+  anchor too). The migration-mode substrate landed with the open-mode work:
+  a future `binaryTrieTime` yields a merkle-patricia genesis and a chain
+  that runs merkle-canonical to the fork (`PBTMode`, guard matrix,
+  `debug_pbtMigrationStatus`), refusing the crossing block with
+  `errPBTSwitchoverNotImplemented`. What remains of the migration
+  lifecycle: maintaining the imported shadow against the tip by replaying
+  Block-Level Access Lists (including reorg rewinds by diff-layer discard —
+  never by history, per the EIP's discard-not-reverse rule), replacing the
+  crossing refusal with switchover execution and the transition window, plus
+  re-anchoring: networking workstreams with no importer dependency.
+- **One EEST binary-tree blocktest fails, and predates the migration work.**
+  `create2_after_eip161_clear_of_storage_holding_account.json` fails with an
+  access-list hash mismatch (local ac6d54.., fixture bb8f29..), verified
+  present at bcf30164bf with zero migration commits. EIP-161-clear plus
+  CREATE2 plus BAL is exactly the shape the eip161-bal work covers; the
+  other 83 binary-tree blocktests pass.
 - **`UpdateAccountBatch`** has no production caller, and it is a trap rather
   than dead weight: its `delegations` slice
   has to be built alongside the code lengths, and an adopter passing nils
