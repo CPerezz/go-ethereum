@@ -423,6 +423,14 @@ func (bc *BlockChain) State() (*state.StateDB, error) {
 // StateAt returns a new mutable state based on a particular point in time.
 func (bc *BlockChain) StateAt(header *types.Header) (*state.StateDB, error) {
 	if bc.pbtMode.canonicalPBT() {
+		// Within the transition, roots older than the fork belong to the
+		// retired merkle trie; resolving them through the binary tree would
+		// read the wrong namespace. Refuse by name — the transition-window
+		// work keeps the merkle side alive for exactly these queries, and
+		// until it lands they are unanswerable, not absent.
+		if bc.pbtMode == PBTModeMigrationPost && !bc.chainConfig.PBTActive(header.Number, header.Time) {
+			return nil, fmt.Errorf("historical merkle-patricia state for pre-transition block %d is unavailable after the switchover in this build", header.Number)
+		}
 		return state.New(header.Root, state.NewPBTDatabase(bc.triedb, bc.codedb))
 	}
 	return state.New(header.Root, state.NewMPTDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps))

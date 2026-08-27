@@ -273,3 +273,17 @@ func TestMigrationPreRefusesCrossingBlocks(t *testing.T) {
 		t.Fatalf("the crossing block failed with %v, want errPBTSwitchoverNotImplemented", err)
 	}
 }
+
+// TestMigrationPostStateAtRefusal pins the named error for pre-fork headers
+// after the switchover, without opening a post-switchover chain: the branch
+// fires before any database is touched, so a minimal chain shell is enough.
+func TestMigrationPostStateAtRefusal(t *testing.T) {
+	cfg := *testPBTChainConfig
+	cfg.BinaryTrieTime = u64(100)
+	bc := &BlockChain{chainConfig: &cfg, pbtMode: PBTModeMigrationPost}
+
+	preFork := &types.Header{Number: big.NewInt(3), Time: 99}
+	if _, err := bc.StateAt(preFork); err == nil || !strings.Contains(err.Error(), "pre-transition block") {
+		t.Fatalf("StateAt(pre-fork header) = %v, want the named pre-transition refusal", err)
+	}
+}
