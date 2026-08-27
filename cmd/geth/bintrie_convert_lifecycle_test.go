@@ -128,7 +128,8 @@ func TestConvertMatchesChain(t *testing.T) {
 	if n, err := chain.InsertChain(blocks); err != nil {
 		t.Fatalf("block %d not inserted: %v", n, err)
 	}
-	headRoot := chain.CurrentBlock().Root
+	head := chain.CurrentBlock()
+	headRoot := head.Root
 
 	// The live post-state dump is the oracle.
 	statedb, err := chain.State()
@@ -167,7 +168,7 @@ func TestConvertMatchesChain(t *testing.T) {
 	})
 	defer src.Close()
 
-	binRoot, err := convertState(chaindb, src, headRoot, conversionOptions{})
+	binRoot, err := convertState(chaindb, src, headRoot, conversionOptions{anchor: head})
 	if err != nil {
 		t.Fatalf("conversion failed: %v", err)
 	}
@@ -175,6 +176,14 @@ func TestConvertMatchesChain(t *testing.T) {
 		t.Fatalf("converted root %x, embedding the executed state produces %x", binRoot, want)
 	}
 	assertConvertedTreeClean(t, chaindb, binRoot)
+
+	// The anchor must land with the completion markers: catch-up starts
+	// somewhere, and the schema promises the marker for conversions too.
+	if number, hash, ok := rawdb.ReadPBTAnchor(rawdb.NewTable(chaindb, string(rawdb.PBTPrefix))); !ok {
+		t.Fatal("an anchored conversion recorded no anchor")
+	} else if number != head.Number.Uint64() || hash != head.Hash() {
+		t.Fatalf("anchor reads back as %d/%x, converted at %d/%x", number, hash, head.Number, head.Hash())
+	}
 
 	// Read the interesting shapes back as a node would.
 	destTriedb := triedb.NewDatabase(chaindb, &triedb.Config{IsPBT: true, PathDB: pathdb.Defaults})
@@ -241,6 +250,10 @@ func TestBintrieConvertDiskBacked(t *testing.T) {
 	binRoot, err := convertState(chaindb, src, root, conversionOptions{tmpDir: datadir})
 	if err != nil {
 		t.Fatalf("conversion failed on a freezer-backed database: %v", err)
+	}
+	// This call site passes no anchor, and none must be invented.
+	if _, _, ok := rawdb.ReadPBTAnchor(rawdb.NewTable(chaindb, string(rawdb.PBTPrefix))); ok {
+		t.Fatal("an unanchored conversion recorded an anchor")
 	}
 	src.Close()
 	chaindb.Close()
