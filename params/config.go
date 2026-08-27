@@ -875,6 +875,19 @@ func (c *ChainConfig) IsPBT() bool {
 	return c.BinaryTrieTime != nil
 }
 
+// PBTActive reports whether the binary tree is the canonical state commitment
+// at the given block context: the fork is scheduled and the context has
+// reached it. It is deliberately distinct from IsPBT, which answers the
+// whole-chain question "is the tree scheduled at all" — the question database
+// guards and offline tooling keep asking with no block in hand. Amsterdam is
+// conjoined the way every time fork here conjoins its predecessors;
+// CheckConfigForkOrder already refuses a binary tree scheduled without
+// Amsterdam, so the conjunction only bites for a context before Amsterdam
+// itself.
+func (c *ChainConfig) PBTActive(num *big.Int, time uint64) bool {
+	return c.IsAmsterdam(num, time) && isTimestampForked(c.BinaryTrieTime, time)
+}
+
 // CheckCompatible checks whether scheduled fork transitions have been imported
 // with a mismatching chain configuration.
 func (c *ChainConfig) CheckCompatible(newcfg *ChainConfig, height uint64, time uint64) *ConfigCompatError {
