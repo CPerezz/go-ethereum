@@ -447,6 +447,7 @@ const maxImportCodeSize = 1 << 20
 type importGroup struct {
 	stem        []byte
 	addr        common.Address
+	addrHash    common.Hash // keccak(addr), carried by its candidate
 	basic       *[32]byte
 	codeHash    *[32]byte
 	delegation  *[32]byte
@@ -456,9 +457,20 @@ type importGroup struct {
 }
 
 type importSlot struct {
-	slot  common.Hash
+	hash  common.Hash // keccak of the slot key
 	value [32]byte
 }
+
+// headerSlotHashes are the keccak hashes of the header-range slot keys,
+// which the join derives from sub-indices rather than reads from a candidate.
+var headerSlotHashes = func() (hashes [bintrie.HeaderStorageSlots]common.Hash) {
+	for i := range hashes {
+		var slot common.Hash
+		slot[31] = byte(i)
+		hashes[i] = crypto.Keccak256Hash(slot[:])
+	}
+	return hashes
+}()
 
 // importOptions carries an import's inputs: the two artifacts, the anchor
 // whose header the state is proven against, and the conversion tunables the
@@ -543,10 +555,11 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// The reader stays sequential, digesting the file; workers check its
 	// order, a batch against the one before it, and derive the candidates
 	// into sorters of their own, which the first then absorbs into one merge.
-	// Keeping the preimages needs their hashes in order, so then the reader
-	// checks the order itself. A record's slot keys go out in runs of at most
-	// a batch's worth, so a contract with many slots is spread over the
-	// workers rather than held whole; the reader counts its header-range
+	// The order check hashes every key, and the candidates carry those hashes
+	// to check 2. Keeping the preimages needs the hashes in order, so then the
+	// reader checks the order as well. A record's slot keys go out in runs of
+	// at most a batch's worth, so a contract with many slots is spread over
+	// the workers rather than held whole; the reader counts its header-range
 	// slots, which only the record as a whole determines.
 	keep := rawBatch != nil && opts.keepPreimages
 	workers := max(opts.workers, 1)
@@ -579,21 +592,20 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 				order := batch.order
 				for i := range batch.runs {
 					run := &batch.runs[i]
-					if !keep {
-						if run.first {
-							if _, err := order.record(run.index, run.addr); err != nil {
-								return err
-							}
-						}
-						if err := order.slots(run.slots, nil); err != nil {
+					if run.first {
+						if _, err := order.record(run.index, run.addr); err != nil {
 							return err
 						}
 					}
-					if err := addSlotCandidates(cand, &buf, run.addr, run.slots); err != nil {
+					c := accountCandidates{cand: cand, buf: &buf, addr: run.addr}
+					if err := order.slots(run.slots, c.slot); err != nil {
 						return err
 					}
 					if run.last {
-						if err := addHeaderCandidate(cand, &buf, run.addr, run.headerSlots); err != nil {
+						// A run sees its own slot keys only: the reader counted
+						// the record's header-range ones.
+						c.addrHash, c.headerSlots = order.addr, run.headerSlots
+						if err := c.finish(); err != nil {
 							return err
 						}
 					}
@@ -759,15 +771,14 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	defer chunkSorter.Close()
 
 	// addSlot records one storage slot everywhere it goes but flat state,
-	// which the check-2 fold writes in keccak order: the preimage store,
-	// and the MPT re-derivation.
-	addSlot := func(accountHash common.Hash, slot common.Hash, value [32]byte) error {
-		var (
-			slotHash = crypto.Keccak256Hash(slot[:])
-			enc, _   = rlp.EncodeToBytes(common.TrimLeftZeroes(value[:]))
-		)
+	// which the check-2 fold writes in keccak order: the MPT re-derivation.
+	// The candidates carry the keys' hashes, so nothing is hashed here.
+	var slotKey []byte
+	addSlot := func(accountHash, slotHash common.Hash, value [32]byte) error {
+		enc, _ := rlp.EncodeToBytes(common.TrimLeftZeroes(value[:]))
 		stats.slots.Add(1)
-		return slotSorter.Add(append(accountHash.Bytes(), slotHash.Bytes()...), enc)
+		slotKey = append(append(slotKey[:0], accountHash[:]...), slotHash[:]...)
+		return slotSorter.Add(slotKey, enc)
 	}
 
 	// sealGroup validates one account's header leaves and records it
@@ -823,15 +834,15 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 				codeSizes[codeHash] = codeSize
 			}
 		}
-		accountHash := crypto.Keccak256Hash(g.addr.Bytes())
+		accountHash := g.addrHash
 		stats.accounts.Add(1)
 
 		value := merkleAccountRecord(nonce, balance, codeHash)
-		if err := acctSorter.Add(accountHash.Bytes(), value); err != nil {
+		if err := acctSorter.Add(accountHash[:], value); err != nil {
 			return err
 		}
 		for _, s := range g.slots {
-			if err := addSlot(accountHash, s.slot, s.value); err != nil {
+			if err := addSlot(accountHash, s.hash, s.value); err != nil {
 				return err
 			}
 		}
@@ -853,7 +864,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		if ckey[0] == bintrie.AccountZone {
 			return fmt.Errorf("preimage file names address %x, which the state does not hold", addr)
 		}
-		return fmt.Errorf("preimage file names slot %x of %x, which the state does not hold",
+		return fmt.Errorf("preimage file names slot hash %x of %x, which the state does not hold",
 			cvalue[common.AddressLength:], addr)
 	}
 
@@ -1002,8 +1013,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 			if !haveStorageHash || addr != lastStorageAddr {
 				lastStorageAddr, lastStorageHash, haveStorageHash = addr, crypto.Keccak256Hash(addr.Bytes()), true
 			}
-			slot := common.BytesToHash(matched[common.AddressLength:])
-			if err := addSlot(lastStorageHash, slot, value); err != nil {
+			if err := addSlot(lastStorageHash, common.Hash(matched[common.AddressLength:]), value); err != nil {
 				return common.Hash{}, err
 			}
 			continue
@@ -1021,7 +1031,8 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 			group = &importGroup{
 				stem:        bytes.Clone(stem),
 				addr:        addr,
-				headerClaim: binary.BigEndian.Uint64(matched[common.AddressLength:]),
+				addrHash:    common.Hash(matched[common.AddressLength:]),
+				headerClaim: binary.BigEndian.Uint64(matched[common.AddressLength+common.HashLength:]),
 			}
 		}
 		leaf := value
@@ -1035,9 +1046,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		case sub >= bintrie.HeaderStorageOffset && sub < bintrie.HeaderStorageOffset+bintrie.HeaderStorageSlots:
 			// The slot number is the sub-index, not something the preimage
 			// file has to be trusted for.
-			var slot common.Hash
-			slot[31] = sub - bintrie.HeaderStorageOffset
-			group.slots = append(group.slots, importSlot{slot: slot, value: leaf})
+			group.slots = append(group.slots, importSlot{hash: headerSlotHashes[sub-bintrie.HeaderStorageOffset], value: leaf})
 			group.headerSeen |= 1 << (sub - bintrie.HeaderStorageOffset)
 		}
 	}
@@ -1251,44 +1260,49 @@ var (
 // sorter copies them, so a worker reuses one buffer for every candidate.
 type candidateBuf struct {
 	key   [bintrie.StorageKeyLength]byte
-	value [common.AddressLength + common.HashLength]byte
+	value [common.AddressLength + common.HashLength + 8]byte
 }
 
-// addSlotCandidates derives the candidate tree keys a run of one record's
-// slot keys stands for: one per overflow slot. A header-range slot's number
+// accountCandidates derives the candidate tree keys of one account as its
+// slots stream past: one per header stem, carrying the address, its hash and
+// a bitmap of the header-range slots claimed, and one per overflow slot,
+// carrying the address and the slot key's hash. A header-range slot's number
 // is its sub-index minus the offset, so it needs no candidate of its own -
 // unlike an overflow slot, whose stem is a one-way hash of the slot number
-// and can only be matched by deriving it forward. The record's header
-// candidate carries the header-range slots (addHeaderCandidate).
-func addSlotCandidates(cand *bintrie.RecordSorter, buf *candidateBuf, addr common.Address, slots []common.Hash) error {
-	var (
-		storagePrefix [32]byte // blake3(address32), hashed once and reused for every overflow slot
-		havePrefix    bool
-	)
-	for _, slot := range slots {
-		inHeader, treeIndex, sub := bintrie.StorageIndex(slot[:])
-		if inHeader {
-			continue
-		}
-		if !havePrefix {
-			a32 := bintrie.Address32(addr)
-			storagePrefix, havePrefix = bintrie.KeyHash(a32[:]), true
-		}
-		key := append(bintrie.AppendStorageStem(buf.key[:0], addr, storagePrefix[:], &treeIndex), sub)
-		value := append(append(buf.value[:0], addr[:]...), slot[:]...)
-		if err := cand.Add(key, value); err != nil {
-			return err
-		}
-	}
-	return nil
+// and can only be matched by deriving it forward. The hashes are check 2's
+// keys; whoever derives the candidates has computed them already.
+type accountCandidates struct {
+	cand          *bintrie.RecordSorter
+	buf           *candidateBuf
+	addr          common.Address
+	addrHash      common.Hash // set before finish
+	headerSlots   uint64
+	storagePrefix [32]byte // blake3(address32), hashed once and reused for every overflow slot
+	havePrefix    bool
 }
 
-// addHeaderCandidate adds the candidate of addr's header stem: the address
-// and a bitmap of the header-range slots its record claims.
-func addHeaderCandidate(cand *bintrie.RecordSorter, buf *candidateBuf, addr common.Address, headerSlots uint64) error {
-	key := bintrie.AppendHeaderStem(buf.key[:0], addr)
-	value := binary.BigEndian.AppendUint64(append(buf.value[:0], addr[:]...), headerSlots)
-	return cand.Add(key, value)
+// slot adds an overflow slot's candidate, or notes a header-range one; hash
+// is keccak(slot).
+func (c *accountCandidates) slot(slot, hash common.Hash) error {
+	inHeader, treeIndex, sub := bintrie.StorageIndex(slot[:])
+	if inHeader {
+		c.headerSlots |= 1 << (sub - bintrie.HeaderStorageOffset)
+		return nil
+	}
+	if !c.havePrefix {
+		a32 := bintrie.Address32(c.addr)
+		c.storagePrefix, c.havePrefix = bintrie.KeyHash(a32[:]), true
+	}
+	key := append(bintrie.AppendStorageStem(c.buf.key[:0], c.addr, c.storagePrefix[:], &treeIndex), sub)
+	value := append(append(c.buf.value[:0], c.addr[:]...), hash[:]...)
+	return c.cand.Add(key, value)
+}
+
+// finish adds the header stem's candidate, once every slot is in.
+func (c *accountCandidates) finish() error {
+	key := bintrie.AppendHeaderStem(c.buf.key[:0], c.addr)
+	value := append(append(c.buf.value[:0], c.addr[:]...), c.addrHash[:]...)
+	return c.cand.Add(key, binary.BigEndian.AppendUint64(value, c.headerSlots))
 }
 
 // leafBatchSize and leafBatches size the snapshot pipeline: leaves per batch,
