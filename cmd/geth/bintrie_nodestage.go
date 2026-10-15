@@ -18,6 +18,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -36,17 +37,36 @@ import (
 // database rewrites the nodes at each level on the way down. One append-only
 // file per depth, replayed in depth order, writes them in ascending key order
 // instead. add only copies nodes into batches; a goroutine of the stager's
-// own appends them to their files, off the tree builder's critical path.
+// own appends them to their files, off the tree builder's critical path,
+// noting where each file's chunks start so that writers can replay them side
+// by side.
 type nodeStager struct {
 	dir    string
-	depths map[int]*spillFile // owned by stage until wait returns
-	count  uint64             // nodes added
+	depths map[int]*stagedDepth // owned by stage until wait returns
+	count  uint64               // nodes added
 
 	cur        *recordBatch
 	work, free chan *recordBatch
 	done       chan struct{}
 	err        atomic.Pointer[error] // the first error stage met
 }
+
+// stagedDepth is one depth's file and the chunks it is cut into.
+type stagedDepth struct {
+	file   *spillFile
+	chunks []stageUnit
+}
+
+// stageUnit is a run of staged nodes, in key order: a chunk of one depth's
+// file, from offset to end, whose first node's path is first.
+type stageUnit struct {
+	file        *spillFile
+	offset, end int64
+	first       []byte
+}
+
+// stageChunkBytes is how much of a depth's file a unit replays at most.
+var stageChunkBytes int64 = 64 << 20
 
 // newNodeStager stages its files in a fresh directory under tmpDir.
 func newNodeStager(tmpDir string) (*nodeStager, error) {
@@ -56,7 +76,7 @@ func newNodeStager(tmpDir string) (*nodeStager, error) {
 	}
 	s := &nodeStager{
 		dir:    dir,
-		depths: make(map[int]*spillFile),
+		depths: make(map[int]*stagedDepth),
 		work:   make(chan *recordBatch, 4),
 		free:   make(chan *recordBatch, 5),
 		done:   make(chan struct{}),
@@ -94,18 +114,23 @@ func (s *nodeStager) stage(work <-chan *recordBatch) {
 	}
 }
 
-// write appends one node to its depth's file.
+// write appends one node to its depth's file, opening a new chunk at every
+// stageChunkBytes.
 func (s *nodeStager) write(path, blob []byte) error {
 	depth := nodeDepth(path)
 	d := s.depths[depth]
 	if d == nil {
-		var err error
-		if d, err = newSpillFile(s.dir, fmt.Sprintf("depth-%d-*", depth)); err != nil {
+		f, err := newSpillFile(s.dir, fmt.Sprintf("depth-%d-*", depth))
+		if err != nil {
 			return err
 		}
+		d = &stagedDepth{file: f}
 		s.depths[depth] = d
 	}
-	return d.add(path, blob)
+	if n := len(d.chunks); n == 0 || d.file.size-d.chunks[n-1].offset >= stageChunkBytes {
+		d.chunks = append(d.chunks, stageUnit{file: d.file, offset: d.file.size, first: bytes.Clone(path)})
+	}
+	return d.file.add(path, blob)
 }
 
 // add copies one node for staging. Neither path nor blob needs to outlive the
@@ -141,27 +166,42 @@ func (s *nodeStager) wait() error {
 	return nil
 }
 
-// replay feeds every staged node to write in database key order: depth by
-// depth, each depth in the order its nodes were added. path and blob are only
-// valid for the call.
-func (s *nodeStager) replay(write func(path, blob []byte) error) error {
+// units returns every staged node in database key order: depth by depth,
+// each depth in the order its nodes were added, in chunks replayUnit reads
+// independently.
+func (s *nodeStager) units() ([]stageUnit, error) {
 	if err := s.wait(); err != nil {
-		return err
+		return nil, err
 	}
-	r := bufio.NewReaderSize(nil, 1<<20)
+	var units []stageUnit
 	for _, depth := range slices.Sorted(maps.Keys(s.depths)) {
-		if err := s.depths[depth].replay(r, write); err != nil {
-			return err
+		d := s.depths[depth]
+		if err := d.file.w.Flush(); err != nil {
+			return nil, err
+		}
+		for i := range d.chunks {
+			u := d.chunks[i]
+			if u.end = d.file.size; i+1 < len(d.chunks) {
+				u.end = d.chunks[i+1].offset
+			}
+			units = append(units, u)
 		}
 	}
-	return nil
+	return units, nil
+}
+
+// replayUnit feeds the nodes of u to write, in order, reading through r.
+// path and blob are only valid for the call. Units replay concurrently.
+func replayUnit(u stageUnit, r *bufio.Reader, write func(path, blob []byte) error) error {
+	r.Reset(io.NewSectionReader(u.file.f, u.offset, u.end-u.offset))
+	return readSpill(r, write)
 }
 
 // close removes the staging files.
 func (s *nodeStager) close() {
 	s.wait()
 	for _, d := range s.depths {
-		d.close()
+		d.file.close()
 	}
 	os.RemoveAll(s.dir)
 }
@@ -172,6 +212,7 @@ type spillFile struct {
 	f    *os.File
 	w    *bufio.Writer
 	head [2 * binary.MaxVarintLen64]byte // a record's length prefix
+	size int64                           // bytes added
 }
 
 // newSpillFile creates a spill file in dir, named from pattern as
@@ -195,6 +236,7 @@ func (s *spillFile) add(a, b []byte) error {
 	if _, err := s.w.Write(a); err != nil {
 		return err
 	}
+	s.size += int64(n + len(a) + len(b))
 	_, err := s.w.Write(b)
 	return err
 }
@@ -209,6 +251,12 @@ func (s *spillFile) replay(r *bufio.Reader, fn func(a, b []byte) error) error {
 		return err
 	}
 	r.Reset(s.f)
+	return readSpill(r, fn)
+}
+
+// readSpill feeds every record r holds to fn; a and b are only valid for the
+// call.
+func readSpill(r *bufio.Reader, fn func(a, b []byte) error) error {
 	var buf []byte
 	for {
 		alen, err := binary.ReadUvarint(r)

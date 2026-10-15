@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -183,7 +184,7 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 			return err
 		}
 		defer acctRows.close()
-		storageSum = written.storage.ahead()
+		storageSum = written.storage.ranges[0].d.ahead()
 		defer storageSum.finish()
 		if batch, err = newNamespaceWriter(db, tmpDir); err != nil {
 			return err
@@ -354,7 +355,7 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 	var rows atomic.Uint64
 	prog = startProgress("Writing flat accounts", "accounts", walkedAccs, rows.Load)
 	defer prog.stop()
-	accountSum := written.accounts.ahead()
+	accountSum := written.accounts.ranges[0].d.ahead()
 	defer accountSum.finish()
 	batch, err := newNamespaceWriter(db, tmpDir)
 	if err != nil {
@@ -649,12 +650,43 @@ func (a *digestAhead) finish() error {
 // storageWritten, if set, runs once every flat storage row is in the
 // database and digested, before the flat accounts are written.
 type writtenState struct {
-	nodes, accounts, storage *writeDigest
+	nodes, accounts, storage *familyDigest
 	storageWritten           func()
 }
 
 func newWrittenState() *writtenState {
-	return &writtenState{nodes: newWriteDigest(), accounts: newWriteDigest(), storage: newWriteDigest()}
+	return &writtenState{nodes: newFamilyDigest(), accounts: newFamilyDigest(), storage: newFamilyDigest()}
+}
+
+// familyDigest digests one key family as written, in ranges: a range holds
+// the records from its start key up to the next range's, the first from the
+// family's own start. Writers fill ranges side by side, and the read-back
+// re-reads them so.
+type familyDigest struct {
+	ranges []digestRange
+}
+
+type digestRange struct {
+	start []byte // family-relative, nil for the first range
+	d     *writeDigest
+}
+
+// newFamilyDigest returns a digest of ranges starting at each of starts
+// after the first, which starts the family.
+func newFamilyDigest(starts ...[]byte) *familyDigest {
+	f := &familyDigest{ranges: []digestRange{{d: newWriteDigest()}}}
+	for _, start := range starts {
+		f.ranges = append(f.ranges, digestRange{start: start, d: newWriteDigest()})
+	}
+	return f
+}
+
+// count returns how many records the family holds.
+func (f *familyDigest) count() (n uint64) {
+	for _, r := range f.ranges {
+		n += r.d.count
+	}
+	return n
 }
 
 // writtenFamily is one key family a command writes, with the digest of what
@@ -662,7 +694,7 @@ func newWrittenState() *writtenState {
 type writtenFamily struct {
 	name   string
 	prefix []byte
-	want   *writeDigest
+	want   *familyDigest
 }
 
 // families lists the key families written: tree nodes, flat accounts, flat
@@ -676,88 +708,156 @@ func (w *writtenState) families() []writtenFamily {
 }
 
 // writeStagedNodes writes the staged tree nodes into db's binary tree
-// namespace in key order, digesting each.
-func writeStagedNodes(ctx context.Context, db ethdb.Database, tmpDir string, nodes *nodeStager, digest *writeDigest) error {
-	batch, err := newNamespaceWriter(db, tmpDir)
+// namespace in key order and returns their digest, a range per staged unit.
+// A database that ingests takes the units side by side on workers
+// goroutines, each into tables of its own, all ingested at once; batches go
+// one at a time, so that flushed tables do not overlap.
+func writeStagedNodes(ctx context.Context, db ethdb.Database, tmpDir string, nodes *nodeStager, workers int) (*familyDigest, error) {
+	units, err := nodes.units()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var (
-		ahead   = digest.ahead()
-		staged  uint64
-		flushed atomic.Uint64
-		prog    = startProgress("Writing tree nodes", "nodes", nodes.count, flushed.Load)
-	)
-	defer batch.close()
-	defer ahead.finish()
+	digest := &familyDigest{}
+	for i, u := range units {
+		start := u.first
+		if i == 0 {
+			start = nil
+		}
+		digest.ranges = append(digest.ranges, digestRange{start: start, d: newWriteDigest()})
+	}
+	var written atomic.Uint64
+	prog := startProgress("Writing tree nodes", "nodes", nodes.count, written.Load)
 	defer prog.stop()
-	err = nodes.replay(func(path, blob []byte) error {
-		ahead.add(path, blob)
-		if err := batch.put(rawdb.TrieNodeAccountPrefix, path, nil, blob); err != nil {
-			return err
-		}
-		if staged++; staged%recordBatchSize == 0 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			flushed.Store(staged)
-		}
-		return batch.flush()
-	})
-	if err != nil {
-		return err
-	}
-	if err := ahead.finish(); err != nil {
-		return err
-	}
-	if err := batch.close(); err != nil {
-		return err
-	}
-	prog.finish("Wrote tree nodes", "nodes", staged)
-	return nil
-}
-
-// verifyWritten re-reads each family in key order, concurrently, and
-// requires it to match what was written. The namespace was empty when the
-// command began, so a family holding anything more is a mismatch as well.
-func verifyWritten(ctx context.Context, pbtdb ethdb.Database, families ...writtenFamily) error {
-	var g errgroup.Group
-	for _, f := range families {
-		g.Go(func() error {
-			var read atomic.Uint64
-			prog := startProgress("Reading back "+f.name+" records", "records", f.want.count, read.Load)
-			defer prog.stop()
-			got := newWriteDigest()
-			ahead := got.ahead()
-			defer ahead.finish()
-			it := pbtdb.NewIterator(f.prefix, nil)
-			defer it.Release()
-			for n := uint64(1); it.Next(); n++ {
-				ahead.add(it.Key()[len(f.prefix):], it.Value())
-				if n%4096 == 0 {
-					read.Store(n)
-					if err := ctx.Err(); err != nil {
-						return err
-					}
+	// write replays one unit through w, digesting it.
+	write := func(i int, w nsWriter, r *bufio.Reader) error {
+		ahead, n := digest.ranges[i].d.ahead(), 0
+		defer ahead.finish()
+		err := replayUnit(units[i], r, func(path, blob []byte) error {
+			ahead.add(path, blob)
+			if n++; n%recordBatchSize == 0 {
+				written.Add(recordBatchSize)
+				if err := ctx.Err(); err != nil {
+					return err
 				}
 			}
-			if err := it.Error(); err != nil {
+			if err := w.put(rawdb.TrieNodeAccountPrefix, path, nil, blob); err != nil {
 				return err
 			}
-			if err := ahead.finish(); err != nil {
-				return err
-			}
-			if got.count != f.want.count || got.sum() != f.want.sum() {
-				return fmt.Errorf("%s records read back differ from those written: %d read, %d written", f.name, got.count, f.want.count)
-			}
-			return nil
+			return w.flush()
 		})
+		if err != nil {
+			return err
+		}
+		return ahead.finish()
+	}
+	ing := ingesterOf(db)
+	if ing == nil {
+		batch := &batchWriter{Batch: db.NewBatch()}
+		r := bufio.NewReaderSize(nil, 1<<20)
+		for i := range units {
+			if err := write(i, batch, r); err != nil {
+				return nil, err
+			}
+		}
+		if err := batch.close(); err != nil {
+			return nil, err
+		}
+	} else {
+		stages := make([]*tableStage, len(units))
+		defer func() {
+			for _, s := range stages {
+				if s != nil {
+					s.finish()
+					os.RemoveAll(s.dir)
+				}
+			}
+		}()
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(max(workers, 1))
+		for i := range units {
+			g.Go(func() error {
+				if err := gctx.Err(); err != nil {
+					return err
+				}
+				s, err := newTableStage(ing, tmpDir)
+				if err != nil {
+					return err
+				}
+				stages[i] = s
+				if err := write(i, s, bufio.NewReaderSize(nil, 256<<10)); err != nil {
+					return err
+				}
+				return s.finish()
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+		var paths []string
+		for _, s := range stages {
+			paths = append(paths, s.paths...)
+		}
+		if err := ing.Ingest(paths); err != nil {
+			return nil, err
+		}
+	}
+	prog.finish("Wrote tree nodes", "nodes", digest.count())
+	return digest, nil
+}
+
+// verifyWritten re-reads each family in key order, its ranges side by side
+// on up to workers goroutines, and requires it to match what was written.
+// The namespace was empty when the command began, so a family holding
+// anything more is a mismatch as well.
+func verifyWritten(ctx context.Context, pbtdb ethdb.Database, workers int, families ...writtenFamily) error {
+	var g errgroup.Group
+	g.SetLimit(max(workers, 1))
+	for _, f := range families {
+		var read atomic.Uint64
+		prog := startProgress("Reading back "+f.name+" records", "records", f.want.count(), read.Load)
+		defer prog.stop()
+		for i, r := range f.want.ranges {
+			var end []byte
+			if i+1 < len(f.want.ranges) {
+				end = f.want.ranges[i+1].start
+			}
+			g.Go(func() error {
+				got := newWriteDigest()
+				ahead := got.ahead()
+				defer ahead.finish()
+				it := pbtdb.NewIterator(f.prefix, r.start)
+				defer it.Release()
+				for n := uint64(1); it.Next(); n++ {
+					key := it.Key()[len(f.prefix):]
+					if end != nil && bytes.Compare(key, end) >= 0 {
+						break
+					}
+					ahead.add(key, it.Value())
+					if n%4096 == 0 {
+						read.Add(4096)
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+					}
+				}
+				if err := it.Error(); err != nil {
+					return err
+				}
+				if err := ahead.finish(); err != nil {
+					return err
+				}
+				if got.count != r.d.count || got.sum() != r.d.sum() {
+					return fmt.Errorf("%s records read back differ from those written: %d read, %d written in range %d", f.name, got.count, r.d.count, i)
+				}
+				return nil
+			})
+		}
 	}
 	return g.Wait()
 }
 
 // logWritten reports a verified write-back.
 func logWritten(written *writtenState) {
-	log.Info("Verified the written state", "nodes", written.nodes.count,
-		"accounts", written.accounts.count, "slots", written.storage.count)
+	log.Info("Verified the written state", "nodes", written.nodes.count(),
+		"accounts", written.accounts.count(), "slots", written.storage.count())
 }

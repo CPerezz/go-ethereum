@@ -40,12 +40,8 @@ type nsWriter interface {
 // flushes, and land below anything they do not overlap, where batches would
 // stall a live node's block processing.
 func newNamespaceWriter(db ethdb.Database, tmpDir string) (nsWriter, error) {
-	if ing, ok := rawdb.KeyValueStoreOf(db).(ethdb.TableIngester); ok {
-		dir, err := os.MkdirTemp(tmpDir, "bintrie-tables-")
-		if err != nil {
-			return nil, err
-		}
-		return &tableStage{db: ing, dir: dir, tables: make(map[string]*familyTable)}, nil
+	if ing := ingesterOf(db); ing != nil {
+		return newTableStage(ing, tmpDir)
 	}
 	return &batchWriter{Batch: db.NewBatch()}, nil
 }
@@ -77,6 +73,12 @@ func (b *batchWriter) close() error {
 	return nil
 }
 
+// ingesterOf returns db's table ingester, or nil if its engine has none.
+func ingesterOf(db ethdb.Database) ethdb.TableIngester {
+	ing, _ := rawdb.KeyValueStoreOf(db).(ethdb.TableIngester)
+	return ing
+}
+
 // ingestTableBytes is the size a family's table is cut at.
 const ingestTableBytes = 64 << 20
 
@@ -91,6 +93,14 @@ type tableStage struct {
 	key    []byte
 	err    error
 	closed bool
+}
+
+func newTableStage(db ethdb.TableIngester, tmpDir string) (*tableStage, error) {
+	dir, err := os.MkdirTemp(tmpDir, "bintrie-tables-")
+	if err != nil {
+		return nil, err
+	}
+	return &tableStage{db: db, dir: dir, tables: make(map[string]*familyTable)}, nil
 }
 
 type familyTable struct {
@@ -127,19 +137,26 @@ func (s *tableStage) put(family, k1, k2, value []byte) error {
 
 func (s *tableStage) flush() error { return s.err }
 
-// close finishes the open tables and, unless a write failed, ingests them
-// all in one call. Later calls return the same.
+// finish closes the open tables, leaving them to be ingested, and returns
+// the first error met.
+func (s *tableStage) finish() error {
+	for family, t := range s.tables {
+		if err := t.w.Close(); err != nil && s.err == nil {
+			s.err = err
+		}
+		delete(s.tables, family)
+	}
+	return s.err
+}
+
+// close finishes the tables and, unless a write failed, ingests them all in
+// one call. Later calls return the same.
 func (s *tableStage) close() error {
 	if s.closed {
 		return s.err
 	}
 	s.closed = true
-	for _, t := range s.tables {
-		if err := t.w.Close(); err != nil && s.err == nil {
-			s.err = err
-		}
-	}
-	if s.err == nil && len(s.paths) > 0 {
+	if s.finish() == nil && len(s.paths) > 0 {
 		s.err = s.db.Ingest(s.paths)
 	}
 	os.RemoveAll(s.dir)
