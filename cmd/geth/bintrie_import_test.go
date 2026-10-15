@@ -158,8 +158,11 @@ func assertNamespaceEqual(t *testing.T, want, got ethdb.Database) {
 // TestImportDiskBacked imports into a pebble database, so the namespace is
 // written by table ingest, which a memory database never takes: the checks
 // hash leaves in memory, so a wrong key on that path would only show as a
-// namespace that reads back differently or not at all.
+// namespace that reads back differently or not at all. Small staging chunks
+// cut each depth into many units, written and read back side by side.
 func TestImportDiskBacked(t *testing.T) {
+	defer func(n int64) { stageChunkBytes = n }(stageChunkBytes)
+	stageChunkBytes = 512
 	alloc := mixedAlloc(8347)
 	convDB, root, binRoot, snapPath, prePath := importFixture(t, alloc)
 

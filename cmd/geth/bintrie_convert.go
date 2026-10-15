@@ -534,15 +534,15 @@ func convertState(chaindb ethdb.Database, srcTriedb *triedb.Database, root commo
 		return common.Hash{}, builderErr
 	}
 	sorter.Close()
-	if err := writeStagedNodes(context.Background(), chaindb, opts.tmpDir, nodes, written.nodes); err != nil {
+	if written.nodes, err = writeStagedNodes(context.Background(), chaindb, opts.tmpDir, nodes, workers); err != nil {
 		return common.Hash{}, err
 	}
 	nodes.close()
-	log.Info("Built binary tree", "nodes", written.nodes.count, "leaves", stats.leaves.Load())
+	log.Info("Built binary tree", "nodes", written.nodes.count(), "leaves", stats.leaves.Load())
 
 	// Both stores must hold exactly what was written before anything becomes
 	// publishable or openable.
-	if err := verifyWritten(context.Background(), pbtdb, written.families()...); err != nil {
+	if err := verifyWritten(context.Background(), pbtdb, workers, written.families()...); err != nil {
 		return common.Hash{}, err
 	}
 	logWritten(written)

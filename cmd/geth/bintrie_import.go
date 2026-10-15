@@ -1084,20 +1084,19 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	prog.finish("Verified snapshot consistency", "root", rebuilt, "leaves", stats.leaves.Load(), "digest", snap.digest())
 	var (
 		written  = newWrittenState()
-		families = written.families()
 		readBack errgroup.Group
 	)
 	defer readBack.Wait()
 	if nodes != nil {
-		if err := writeStagedNodes(ctx, chaindb, opts.tmpDir, nodes, written.nodes); err != nil {
+		if written.nodes, err = writeStagedNodes(ctx, chaindb, opts.tmpDir, nodes, opts.workers); err != nil {
 			return common.Hash{}, err
 		}
 		// The tree nodes are all written: read them back while the code
 		// limb and check 2 run. Reading puts nothing in the memtable.
-		readBack.Go(func() error { return verifyWritten(ctx, pbtdb, families[0]) })
+		readBack.Go(func() error { return verifyWritten(ctx, pbtdb, opts.workers, written.families()[0]) })
 		// Likewise the flat storage, once check 2 has written its last row.
 		written.storageWritten = func() {
-			readBack.Go(func() error { return verifyWritten(ctx, pbtdb, families[2]) })
+			readBack.Go(func() error { return verifyWritten(ctx, pbtdb, opts.workers, written.families()[2]) })
 		}
 	}
 
@@ -1183,7 +1182,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	if err := flush(true); err != nil {
 		return common.Hash{}, err
 	}
-	if err := verifyWritten(ctx, pbtdb, families[1]); err != nil {
+	if err := verifyWritten(ctx, pbtdb, opts.workers, written.families()[1]); err != nil {
 		return common.Hash{}, err
 	}
 	if err := readBack.Wait(); err != nil {
