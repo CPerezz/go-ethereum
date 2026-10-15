@@ -35,6 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
@@ -290,7 +291,8 @@ func TestConvertRefusesDirtyNamespace(t *testing.T) {
 
 // tamperDB passes every write through except the first record of one key
 // family, which it drops, corrupts or doubles with a stray neighbour: a store
-// that loses or mangles a write on its way in.
+// that loses or mangles a write on its way in, through a batch or, if the
+// store ingests, through a table.
 type tamperDB struct {
 	ethdb.Database
 	family []byte // full key prefix, the namespace's table prefix included
@@ -304,32 +306,88 @@ func newTamperDB(db ethdb.Database, family []byte, mode string) *tamperDB {
 
 func (db *tamperDB) NewBatch() ethdb.Batch { return tamperBatch{db.Database.NewBatch(), db} }
 
-type tamperBatch struct {
-	ethdb.Batch
-	db *tamperDB
+// Unwrap hands ingesterOf the store, its tables tampered with as batches are.
+func (db *tamperDB) Unwrap() ethdb.Database {
+	kv := rawdb.KeyValueStoreOf(db.Database)
+	ing, ok := kv.(ethdb.TableIngester)
+	if !ok {
+		return db.Database
+	}
+	return rawdb.NewDatabase(tamperKV{kv, ing, db})
 }
 
-func (b tamperBatch) Put(key, value []byte) error {
-	if !bytes.HasPrefix(key, b.db.family) || !b.db.done.CompareAndSwap(false, true) {
-		return b.Batch.Put(key, value)
+// put writes one record through put, tampering with the family's first. The
+// stray neighbour sorts right after the record, so a table takes it in order
+// and keeps its key range.
+func (db *tamperDB) put(key, value []byte, put func(key, value []byte) error) error {
+	if !bytes.HasPrefix(key, db.family) || !db.done.CompareAndSwap(false, true) {
+		return put(key, value)
 	}
-	switch b.db.mode {
+	switch db.mode {
 	case "drop":
 		return nil
 	case "corrupt":
 		value = append(common.CopyBytes(value[:len(value)-1]), value[len(value)-1]^0xff)
 	case "stray":
-		if err := b.Batch.Put(append(common.CopyBytes(key), 0xff), value); err != nil {
+		if err := put(key, value); err != nil {
 			return err
 		}
+		key = append(common.CopyBytes(key), 0)
 	}
-	return b.Batch.Put(key, value)
+	return put(key, value)
+}
+
+type tamperBatch struct {
+	ethdb.Batch
+	db *tamperDB
+}
+
+func (b tamperBatch) Put(key, value []byte) error { return b.db.put(key, value, b.Batch.Put) }
+
+type tamperKV struct {
+	ethdb.KeyValueStore
+	ing ethdb.TableIngester
+	db  *tamperDB
+}
+
+func (kv tamperKV) NewTableWriter(path string) (ethdb.TableWriter, error) {
+	w, err := kv.ing.NewTableWriter(path)
+	if err != nil {
+		return nil, err
+	}
+	return tamperTable{w, kv.db}, nil
+}
+
+func (kv tamperKV) Ingest(paths []string) error { return kv.ing.Ingest(paths) }
+
+type tamperTable struct {
+	ethdb.TableWriter
+	db *tamperDB
+}
+
+func (w tamperTable) Put(key, value []byte) error { return w.db.put(key, value, w.TableWriter.Put) }
+
+// diskDB opens a pebble database: the namespace's bulk writers ingest tables
+// into it, where a memory database takes batches.
+func diskDB(t *testing.T) ethdb.Database {
+	t.Helper()
+	kv, err := pebble.New(t.TempDir(), 0, 0, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := rawdb.NewDatabase(kv)
+	t.Cleanup(func() { db.Close() })
+	return db
 }
 
 // TestWrittenStateCatchesBadWrites pins both commands' read-back check: a
 // record of any family that the store drops, corrupts or doubles on its way
-// in fails the run, naming the family, and nothing is attested.
+// in fails the run, naming the family, and nothing is attested. It holds for
+// batches and for ingested tables, the path a node's database takes, with the
+// tree nodes cut into several units written side by side.
 func TestWrittenStateCatchesBadWrites(t *testing.T) {
+	defer func(n int64) { stageChunkBytes = n }(stageChunkBytes)
+	stageChunkBytes = 512
 	_, root, _, snapPath, prePath := importFixture(t, artifactAlloc())
 	caught := func(t *testing.T, err error, chaindb ethdb.Database, family string) {
 		t.Helper()
@@ -340,32 +398,41 @@ func TestWrittenStateCatchesBadWrites(t *testing.T) {
 			t.Fatal("a run with a bad write attested its namespace")
 		}
 	}
-	for _, f := range []struct {
-		name   string
-		prefix []byte
+	opts := func(t *testing.T) conversionOptions { return conversionOptions{tmpDir: t.TempDir(), workers: 4} }
+	for _, store := range []struct {
+		name string
+		open func(*testing.T) ethdb.Database
 	}{
-		{"tree node", rawdb.TrieNodeAccountPrefix},
-		{"flat account", rawdb.SnapshotAccountPrefix},
-		{"flat storage", rawdb.SnapshotStoragePrefix},
+		{"batches", func(*testing.T) ethdb.Database { return rawdb.NewMemoryDatabase() }},
+		{"tables", diskDB},
 	} {
-		for _, mode := range []string{"drop", "corrupt", "stray"} {
-			t.Run("convert/"+f.name+"/"+mode, func(t *testing.T) {
-				chaindb := rawdb.NewMemoryDatabase()
-				srcTriedb := triedb.NewDatabase(chaindb, &triedb.Config{Preimages: true, PathDB: pathdb.Defaults})
-				gspec := &core.Genesis{Config: params.TestChainConfig, BaseFee: big.NewInt(params.InitialBaseFee), Alloc: artifactAlloc()}
-				root := gspec.MustCommit(chaindb, srcTriedb).Root()
-				srcTriedb.Close()
-				src := triedb.NewDatabase(chaindb, &triedb.Config{Preimages: true, PathDB: pathdb.ReadOnly})
-				defer src.Close()
-				_, err := convertState(newTamperDB(chaindb, f.prefix, mode), src, root, conversionOptions{tmpDir: t.TempDir()})
-				caught(t, err, chaindb, f.name)
-			})
-			t.Run("import/"+f.name+"/"+mode, func(t *testing.T) {
-				chaindb := rawdb.NewMemoryDatabase()
-				_, err := importState(context.Background(), newTamperDB(chaindb, f.prefix, mode), importOptions{snapshot: snapPath, preimages: prePath,
-					anchor: &types.Header{Number: big.NewInt(1), Root: root}, conversionOptions: conversionOptions{tmpDir: t.TempDir()}})
-				caught(t, err, chaindb, f.name)
-			})
+		for _, f := range []struct {
+			name   string
+			prefix []byte
+		}{
+			{"tree node", rawdb.TrieNodeAccountPrefix},
+			{"flat account", rawdb.SnapshotAccountPrefix},
+			{"flat storage", rawdb.SnapshotStoragePrefix},
+		} {
+			for _, mode := range []string{"drop", "corrupt", "stray"} {
+				t.Run(store.name+"/convert/"+f.name+"/"+mode, func(t *testing.T) {
+					chaindb := store.open(t)
+					srcTriedb := triedb.NewDatabase(chaindb, &triedb.Config{Preimages: true, PathDB: pathdb.Defaults})
+					gspec := &core.Genesis{Config: params.TestChainConfig, BaseFee: big.NewInt(params.InitialBaseFee), Alloc: artifactAlloc()}
+					root := gspec.MustCommit(chaindb, srcTriedb).Root()
+					srcTriedb.Close()
+					src := triedb.NewDatabase(chaindb, &triedb.Config{Preimages: true, PathDB: pathdb.ReadOnly})
+					defer src.Close()
+					_, err := convertState(newTamperDB(chaindb, f.prefix, mode), src, root, opts(t))
+					caught(t, err, chaindb, f.name)
+				})
+				t.Run(store.name+"/import/"+f.name+"/"+mode, func(t *testing.T) {
+					chaindb := store.open(t)
+					_, err := importState(context.Background(), newTamperDB(chaindb, f.prefix, mode), importOptions{snapshot: snapPath, preimages: prePath,
+						anchor: &types.Header{Number: big.NewInt(1), Root: root}, conversionOptions: opts(t)})
+					caught(t, err, chaindb, f.name)
+				})
+			}
 		}
 	}
 }

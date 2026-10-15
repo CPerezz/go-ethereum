@@ -32,12 +32,14 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
@@ -155,12 +157,14 @@ func assertNamespaceEqual(t *testing.T, want, got ethdb.Database) {
 	}
 }
 
-// TestImportDiskBacked imports into a pebble database, so the namespace is
-// written by table ingest, which a memory database never takes: the checks
+// TestDiskBacked converts and imports into pebble databases, so the namespace
+// is written by table ingest, which a memory database never takes: the checks
 // hash leaves in memory, so a wrong key on that path would only show as a
 // namespace that reads back differently or not at all. Small staging chunks
-// cut each depth into many units, written and read back side by side.
-func TestImportDiskBacked(t *testing.T) {
+// cut each depth into many units, written and read back side by side. The
+// read-back only holds the database to the nodes replayed, so the stored tree
+// is walked from its root too: a node lost before it was written breaks it.
+func TestDiskBacked(t *testing.T) {
 	defer func(n int64) { stageChunkBytes = n }(stageChunkBytes)
 	stageChunkBytes = 512
 	alloc := mixedAlloc(8347)
@@ -188,6 +192,25 @@ func TestImportDiskBacked(t *testing.T) {
 		t.Fatalf("imported root %x, the converter built %x", imported, binRoot)
 	}
 	assertNamespaceEqual(t, convDB, db)
+	assertConvertedTreeClean(t, db, imported)
+
+	// The converter writes the same namespace, its flat state from several
+	// workers.
+	convDisk := diskDB(t)
+	srcTriedb := triedb.NewDatabase(convDisk, &triedb.Config{Preimages: true, PathDB: pathdb.Defaults})
+	gspec := &core.Genesis{Config: params.TestChainConfig, BaseFee: big.NewInt(params.InitialBaseFee), Alloc: alloc}
+	gspec.MustCommit(convDisk, srcTriedb)
+	srcTriedb.Close()
+	src := triedb.NewDatabase(convDisk, &triedb.Config{Preimages: true, PathDB: pathdb.ReadOnly})
+	defer src.Close()
+	converted, err := convertState(convDisk, src, root, conversionOptions{tmpDir: t.TempDir(), workers: 4})
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	if converted != binRoot {
+		t.Fatalf("converted root %x on disk, %x in memory", converted, binRoot)
+	}
+	assertNamespaceEqual(t, convDB, convDisk)
 
 	// The state reads through the stack a node uses, off the ingested tables.
 	tdb := triedb.NewDatabase(db, &triedb.Config{IsPBT: true, PathDB: pathdb.Defaults})
@@ -205,6 +228,22 @@ func TestImportDiskBacked(t *testing.T) {
 				t.Fatalf("slot %x of %x reads %x, want %x", slot, addr, got, value)
 			}
 		}
+	}
+}
+
+// TestStagingFailureFailsWriteOut: a node the stager could not write must fail
+// the write-out. A run would notice the loss nowhere else: the read-back
+// digests the nodes replayed, and the root is the builder's.
+func TestStagingFailureFailsWriteOut(t *testing.T) {
+	nodes, err := newNodeStager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.close()
+	os.RemoveAll(nodes.dir) // no depth file can be created
+	nodes.add([]byte{0, 1, 0x80}, []byte{1})
+	if _, err := nodes.units(); err == nil {
+		t.Fatal("a node the stager failed to write went unreported")
 	}
 }
 
