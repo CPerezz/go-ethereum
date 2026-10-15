@@ -19,6 +19,7 @@ package bintrie
 import (
 	"encoding/binary"
 	"math/bits"
+	"slices"
 )
 
 // bitstr is a bit string packed MSB-first into bytes. Unused low bits of the
@@ -52,10 +53,16 @@ func (p bitstr) equal(q bitstr) bool {
 
 // slice extracts n bits of key starting at bit position from, as a bitstr.
 func slice(key []byte, from, n int) bitstr {
-	out := bitstr{b: make([]byte, (n+7)/8), n: n}
+	return sliceInto(nil, key, from, n)
+}
+
+// sliceInto is slice reusing buf's backing array, for a caller that is done
+// with the result before its next call.
+func sliceInto(buf, key []byte, from, n int) bitstr {
+	out := bitstr{b: slices.Grow(buf[:0], (n+7)/8)[:(n+7)/8], n: n}
 	// Fast path: byte-aligned source range.
 	if from&7 == 0 {
-		copy(out.b, key[from>>3:])
+		clear(out.b[copy(out.b, key[from>>3:]):])
 	} else {
 		shift := from & 7
 		for i := range out.b {
@@ -214,6 +221,7 @@ func appendPath(dst, key []byte, n int) []byte {
 	if n == 0 {
 		return dst
 	}
+
 	dst = append(dst, byte(n>>8), byte(n))
 	dst = append(dst, key[:(n+7)/8]...)
 	if n&7 != 0 {

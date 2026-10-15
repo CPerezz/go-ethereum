@@ -57,11 +57,10 @@ type StackBuilder struct {
 
 	// Scratch reused across every emitted record: each node is built,
 	// hashed and handed to onNode once, so one instance of each serves the
-	// whole build, marked dirty before every use; path and blob back the
-	// record handed to onNode.
-	groupScratch  groupNode
-	branchScratch branchNode
-	path, blob    []byte
+	// whole build, marked dirty before every use; prefix, path and blob back
+	// a branch's prefix and the record handed to onNode.
+	groupScratch       groupNode
+	prefix, path, blob []byte
 
 	par *buildPipeline // hashing on goroutines of its own, if set
 }
@@ -201,16 +200,15 @@ func hashGroup(g *groupNode, stem, subs, vals []byte, pos int) common.Hash {
 }
 
 // emitBranch hashes the branch at position pos splitting on bit split, whose
-// prefix is key's bits in between, and hands it to onNode.
+// prefix is key's bits in between, and hands it to onNode: what a branchNode
+// over two hashed children hashes and serializes to.
 func (b *StackBuilder) emitBranch(key []byte, pos, split int, left, right common.Hash) common.Hash {
-	b.branchScratch.prefix = slice(key, pos, split-pos)
-	b.branchScratch.left = hashedNode(left)
-	b.branchScratch.right = hashedNode(right)
-	b.branchScratch.dirty = true
-	h := b.branchScratch.hashAt(pos)
+	prefix := sliceInto(b.prefix, key, pos, split-pos)
+	b.prefix = prefix.b
+	h := branchHash(prefix, left, right)
 	if b.onNode != nil {
 		b.path = appendPath(b.path[:0], key, pos)
-		b.blob = appendNode(b.blob[:0], &b.branchScratch, pos)
+		b.blob = appendBranchBlob(b.blob[:0], prefix, left, right)
 		b.onNode(b.path, h, b.blob)
 	}
 	return h
