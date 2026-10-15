@@ -741,23 +741,20 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// Tree nodes are staged per depth and written only once check 1 has
 	// passed, in key order (see nodeStager).
 	var (
-		builderErr error
-		onNode     func(path []byte, hash common.Hash, blob []byte)
-		nodes      *nodeStager
+		onNode func(path []byte, hash common.Hash, blob []byte)
+		nodes  *nodeStager
 	)
 	if !verifyOnly {
 		if nodes, err = newNodeStager(opts.tmpDir); err != nil {
 			return common.Hash{}, err
 		}
 		defer nodes.close()
-		onNode = func(path []byte, hash common.Hash, blob []byte) {
-			if builderErr != nil {
-				return
-			}
-			builderErr = nodes.add(path, blob)
-		}
+		// The builder's fold goroutine calls this; a staging error
+		// resurfaces when the nodes are written (see nodeStager.wait).
+		onNode = func(path []byte, _ common.Hash, blob []byte) { nodes.add(path, blob) }
 	}
-	builder := bintrie.NewStackBuilder(onNode)
+	builder := bintrie.NewParallelStackBuilder(onNode, opts.workers)
+	defer builder.Stop()
 
 	var (
 		acctSorter  = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // keccak(addr) -> nonce ‖ balance ‖ codeHash
@@ -921,7 +918,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// The pass is a pipeline: a decoder goroutine reads the snapshot into
 	// batches, which the tree builder's goroutine and this loop each consume
 	// in order, so decoding, hashing and joining overlap.
-	pipe := startLeafPipeline(snap, builder, &builderErr)
+	pipe := startLeafPipeline(snap, builder)
 	defer pipe.stop()
 	var (
 		batch *leafBatch
@@ -1083,9 +1080,6 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 
 	// Check 1: the leaves must rebuild to the claimed root.
 	rebuilt := builder.Finish()
-	if builderErr != nil {
-		return common.Hash{}, builderErr
-	}
 	if rebuilt != snap.root {
 		return common.Hash{}, fmt.Errorf("snapshot leaves rebuild to %x, its pbtRoot claims %x", rebuilt, snap.root)
 	}
@@ -1344,9 +1338,8 @@ type leafPipeline struct {
 	g      *errgroup.Group
 }
 
-// startLeafPipeline starts decoding snap and feeding builder; *builderErr is
-// the error builder's node callback records.
-func startLeafPipeline(snap *snapshotReader, builder *bintrie.StackBuilder, builderErr *error) *leafPipeline {
+// startLeafPipeline starts decoding snap and feeding builder.
+func startLeafPipeline(snap *snapshotReader, builder *bintrie.StackBuilder) *leafPipeline {
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 	p := &leafPipeline{
@@ -1400,9 +1393,6 @@ func startLeafPipeline(snap *snapshotReader, builder *bintrie.StackBuilder, buil
 			for i := range b.values {
 				if err := builder.Add(b.key(i), b.values[i][:]); err != nil {
 					return err
-				}
-				if *builderErr != nil {
-					return *builderErr
 				}
 			}
 			p.release(b)
