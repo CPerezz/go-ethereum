@@ -305,12 +305,13 @@ func (s *RecordSorter) Sort() (*RecordStream, error) {
 
 // mergeBufSize sizes each run's read buffer for a merge of runs runs: 512 KiB,
 // less once the buffers together would pass a quarter of the budget, never
-// under 64 KiB. A mainnet sort merges thousands of runs.
+// under 16 KiB. A mainnet sort merges thousands of runs, which the kernel
+// reads ahead of the buffers anyway.
 func mergeBufSize(budget, runs int) int {
 	if budget <= 0 || runs == 0 {
 		return 1 << 19
 	}
-	return min(1<<19, max(64<<10, budget/(4*runs)))
+	return min(1<<19, max(16<<10, budget/(4*runs)))
 }
 
 // Close removes the temporary files; call after any returned stream drains.
