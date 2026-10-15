@@ -401,7 +401,7 @@ func exportArtifacts(ctx context.Context, chaindb ethdb.Database, srcTriedb *tri
 		}
 	}()
 	stats := newStats("Exporting state")
-	stream, _, closeScan, err := scanState(ctx, chaindb, plan, preimages, false, opts, stats)
+	stream, closeScan, err := scanState(ctx, chaindb, plan, preimages, nil, opts, stats)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -452,13 +452,13 @@ func exportArtifacts(ctx context.Context, chaindb ethdb.Database, srcTriedb *tri
 
 // convertPlan converts the state at opts.anchor's root over plan into the
 // binary tree namespace per EIP-8347, the self-converter's way: one scan,
-// split by account hash across workers, derives every leaf and the keys
-// behind it, an external sort orders the leaves in tree-key order, and the
-// import's pipeline builds the tree bottom-up from them in one pass and runs
-// the dual-check a self-converter owes on those same leaves: check 2 and its
-// code limb, not check 1 (see ownLeaves). The attestation lands last, so an
-// interrupted run refuses to open. Cancelling ctx stops it between batches,
-// before anything is attested.
+// split by account hash across workers, derives every leaf, folds the merkle
+// state back from those leaves and writes the flat state (see selfCheck); an
+// external sort orders the leaves in tree-key order, the tree is built
+// bottom-up from them in one pass, and it must hold exactly the leaves the
+// scan derived. Check 1 has no claim to check: the build is the tree. The
+// attestation lands last, so an interrupted run refuses to open. Cancelling
+// ctx stops it between batches, before anything is attested.
 func convertPlan(ctx context.Context, chaindb ethdb.Database, plan scanPlan, opts conversionOptions) (common.Hash, error) {
 	if plan.release != nil {
 		defer plan.release()
@@ -470,37 +470,98 @@ func convertPlan(ctx context.Context, chaindb ethdb.Database, plan scanPlan, opt
 	} else if dirty {
 		return common.Hash{}, errors.New("binary tree namespace is not empty")
 	}
-	stream, cands, closeScan, err := scanState(ctx, chaindb, plan, nil, true, opts, newStats("Converting state"))
+	// The flat state is digested per scan range, which its writers fill
+	// side by side.
+	written := newWrittenState()
+	var starts [][]byte
+	for _, r := range plan.ranges[1:] {
+		starts = append(starts, r.start[:])
+	}
+	written.accounts, written.storage = newFamilyDigest(starts...), newFamilyDigest(starts...)
+	checks := make([]*selfCheck, len(plan.ranges))
+	defer func() {
+		for _, c := range checks {
+			if c != nil {
+				c.close()
+			}
+		}
+	}()
+	for i := range checks {
+		var err error
+		if checks[i], err = newSelfCheck(chaindb, opts.tmpDir, written, i); err != nil {
+			return common.Hash{}, err
+		}
+	}
+	stats := newStats("Converting state")
+	stream, closeScan, err := scanState(ctx, chaindb, plan, nil, checks, opts, stats)
 	if err != nil {
 		return common.Hash{}, err
 	}
 	defer closeScan()
-	return importState(ctx, chaindb, importOptions{anchor: opts.anchor, own: &ownLeaves{leaves: stream, candidates: cands}, conversionOptions: opts})
+	var emitted leafSum
+	for _, c := range checks {
+		if err := c.finish(); err != nil {
+			return common.Hash{}, err
+		}
+		emitted.merge(&c.sum)
+	}
+	// The account trie folds while the tree builds.
+	var (
+		folded          common.Hash
+		fold, readNodes errgroup.Group
+	)
+	// Background work ends with this call, however it ends.
+	bctx, cancel := context.WithCancel(ctx)
+	defer fold.Wait()
+	defer readNodes.Wait()
+	defer cancel()
+	fold.Go(func() (err error) {
+		folded, err = foldSpilledAccounts(bctx, checks, stats.accounts.Load())
+		return err
+	})
+	root, nodes, err := buildOwnTree(ctx, chaindb, streamLeaves{stream}, &emitted, opts)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	written.nodes = nodes
+	pbtdb := rawdb.NewTable(chaindb, string(rawdb.PBTPrefix))
+	readNodes.Go(func() error { return verifyWritten(bctx, pbtdb, opts.workers, written.families()[0]) })
+	if err := fold.Wait(); err != nil {
+		return common.Hash{}, err
+	}
+	if folded != opts.anchor.Root {
+		return common.Hash{}, fmt.Errorf("the leaves re-derive merkle root %x, the anchor commits %x", folded, opts.anchor.Root)
+	}
+	log.Info("Verified consensus anchoring", "stateRoot", folded, "accounts", stats.accounts.Load(), "slots", stats.slots.Load())
+	if err := verifyWritten(ctx, pbtdb, opts.workers, written.families()[1:]...); err != nil {
+		return common.Hash{}, err
+	}
+	if err := readNodes.Wait(); err != nil {
+		return common.Hash{}, err
+	}
+	logWritten(written)
+	if err := attestTree(ctx, pbtdb, root, opts.anchor, opts.beforeAttest); err != nil {
+		return common.Hash{}, err
+	}
+	return root, nil
 }
 
-// scanState runs plan's scan, each worker over its range into sorters of its
-// own, and merges what they derived: the leaves in tree-key order and, with
-// cands, the keys behind them that the dual-check joins against. preimages,
-// when set, receives the preimage file in scan order. closeAll releases the
-// sorters once the stream is drained.
-func scanState(ctx context.Context, chaindb ethdb.Database, plan scanPlan, preimages *preimageFile, cands bool, opts conversionOptions, stats *conversionStats) (stream *bintrie.RecordStream, candidates *bintrie.RecordSorter, closeAll func(), err error) {
+// scanState runs plan's scan, each worker over its range into a sorter of its
+// own, and merges the leaves they derived in tree-key order. preimages, when
+// set, receives the preimage file in scan order; checks, when set, each run
+// the matching worker's share of a self-converter's dual-check. closeAll
+// releases the sorters once the stream is drained.
+func scanState(ctx context.Context, chaindb ethdb.Database, plan scanPlan, preimages *preimageFile, checks []*selfCheck, opts conversionOptions, stats *conversionStats) (stream *bintrie.RecordStream, closeAll func(), err error) {
 	workers := len(plan.ranges)
-	// A worker's sorters are alive at once, and a sealed one keeps its
+	// A worker's sorter is alive throughout, and a sealed one keeps its
 	// buffer while its stream drains, so the budget is split rather than
 	// reused.
-	sorters := workers
-	if cands {
-		sorters *= 2
-	}
-	share := splitBudget(opts.sortBudget, sorters)
+	share := splitBudget(opts.sortBudget, workers)
 	parts := make([]scanPart, workers)
 	closeParts := func() {
 		for _, p := range parts {
 			if p.leaves != nil {
 				p.leaves.Close()
-			}
-			if p.cands != nil {
-				p.cands.Close()
 			}
 		}
 	}
@@ -511,8 +572,8 @@ func scanState(ctx context.Context, chaindb ethdb.Database, plan scanPlan, preim
 	}()
 	for i, r := range plan.ranges {
 		parts[i] = scanPart{hashRange: r, leaves: bintrie.NewLeafSorter(opts.tmpDir, share)}
-		if cands {
-			parts[i].cands = bintrie.NewRecordSorter(opts.tmpDir, share, nil)
+		if checks != nil {
+			parts[i].check = checks[i]
 		}
 	}
 	// Every worker writes its range of the preimage file: the first straight
@@ -523,7 +584,7 @@ func scanState(ctx context.Context, chaindb ethdb.Database, plan scanPlan, preim
 		for i := 1; i < workers; i++ {
 			frag, err := newPreimageFragment(opts.tmpDir)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, err
 			}
 			defer frag.abort()
 			writers[i] = frag
@@ -537,7 +598,7 @@ func scanState(ctx context.Context, chaindb ethdb.Database, plan scanPlan, preim
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	// Nothing reads the source past the scan.
 	if plan.release != nil {
@@ -545,27 +606,22 @@ func scanState(ctx context.Context, chaindb ethdb.Database, plan scanPlan, preim
 	}
 	if preimages != nil {
 		if err := preimages.join(writers[1:]); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 	}
 	stats.report(true)
 
 	// One merge serves every worker's records.
-	sorter, candidates := parts[0].leaves, parts[0].cands
+	sorter := parts[0].leaves
 	for _, p := range parts[1:] {
 		if err := sorter.Absorb(p.leaves); err != nil {
-			return nil, nil, nil, err
-		}
-		if cands {
-			if err := candidates.Absorb(p.cands); err != nil {
-				return nil, nil, nil, err
-			}
+			return nil, nil, err
 		}
 	}
 	if stream, err = sorter.Sort(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	return stream, candidates, closeParts, nil
+	return stream, closeParts, nil
 }
 
 // leafSource yields the source state's accounts from a seek hash on, then
@@ -658,11 +714,12 @@ func splitBudget(budget, n int) int {
 	return max(budget/n, 1)
 }
 
-// scanPart is one scan worker's share: its range of account hashes and the
-// sorters it derives into.
+// scanPart is one scan worker's share: its range of account hashes, the
+// sorter it derives into and, for a self-converter, its share of the check.
 type scanPart struct {
 	hashRange
-	leaves, cands *bintrie.RecordSorter
+	leaves *bintrie.RecordSorter
+	check  *selfCheck
 }
 
 // codeInfo is what an account header needs of its code: the size, and the
@@ -801,9 +858,8 @@ func (f *fileKeys) close() error {
 }
 
 // deriveLeaves scans part's range of the source state at root, deriving
-// every tree leaf into the part's sorter and, when the part has one, the keys
-// behind them into its candidates sorter. It gives up once ctx is cancelled,
-// by another worker failing.
+// every tree leaf into the part's sorter and handing it to the part's check,
+// if any. It gives up once ctx is cancelled, by another worker failing.
 func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, part *scanPart, keys keySource, codes *codeSet, preimages *preimageFile, stats *conversionStats) error {
 	// ponytail: an export's flat scan holds one pebble read snapshot per
 	// worker throughout, pinning a memtable and every table compacted
@@ -822,11 +878,14 @@ func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, p
 			return nil
 		}
 		leaves++
+		if part.check != nil {
+			part.check.leaf(key, value)
+		}
 		return part.leaves.Add(key, value[:])
 	}
-	// scanStorage derives one account's slots and their join candidates; the
-	// deferred release keeps the iterator from leaking on any error path.
-	scanStorage := func(accountHash common.Hash, addr common.Address, storageRoot common.Hash, cands *accountCandidates) error {
+	// scanStorage derives one account's slots; the deferred release keeps
+	// the iterator from leaking on any error path.
+	scanStorage := func(accountHash common.Hash, addr common.Address, storageRoot common.Hash) error {
 		storageIter, err := src.storage(accountHash, storageRoot)
 		if err != nil {
 			return fmt.Errorf("failed to open storage for %x: %w", addr, err)
@@ -856,9 +915,9 @@ func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, p
 			if err := emit(bintrie.StorageSlotKey(addr, slotKey[:]), padded); err != nil {
 				return err
 			}
-			// A zero slot emits no leaf, so it may claim no key either.
-			if cands != nil && padded != ([32]byte{}) {
-				if err := cands.slot(slotKey, slotHash); err != nil {
+			// A zero slot emits no leaf, so the merkle state folds none.
+			if part.check != nil && padded != ([32]byte{}) {
+				if err := part.check.slot(accountHash, slotHash, padded); err != nil {
 					return err
 				}
 			}
@@ -869,7 +928,6 @@ func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, p
 		}
 		return nil
 	}
-	var candBuf candidateBuf // the sorter copies each candidate, so one buffer serves the scan
 	for accIter.Next() {
 		accountHash := accIter.Hash()
 		if part.past(accountHash) {
@@ -896,17 +954,13 @@ func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, p
 		if err := emitAccountHeader(chaindb, addr, acc.Nonce, acc.Balance, common.BytesToHash(acc.CodeHash), codes, stats, emit); err != nil {
 			return err
 		}
-		var cands *accountCandidates
-		if part.cands != nil {
-			cands = &accountCandidates{cand: part.cands, buf: &candBuf, addr: addr, addrHash: accountHash}
-		}
 		if acc.Root != types.EmptyRootHash {
-			if err := scanStorage(accountHash, addr, acc.Root, cands); err != nil {
+			if err := scanStorage(accountHash, addr, acc.Root); err != nil {
 				return err
 			}
 		}
-		if cands != nil {
-			if err := cands.finish(); err != nil {
+		if part.check != nil {
+			if err := part.check.account(accountHash); err != nil {
 				return err
 			}
 		}
@@ -983,17 +1037,26 @@ func emitAccountHeader(chaindb ethdb.Database, addr common.Address, nonce uint64
 }
 
 // emitCodeChunks derives one bytecode's code-zone leaves; all-zero chunks
-// resolve to absence and are skipped.
+// resolve to absence and are skipped. The code store has no integrity of its
+// own, so the leaves must reassemble into code that hashes to codeHash: the
+// code limb of the dual-check, on the leaves as they are emitted.
 func emitCodeChunks(codeHash common.Hash, code []byte, emit func([]byte, [32]byte) error) error {
-	chunks := bintrie.ChunkifyCode(code)
-	for i := 0; i < len(chunks)/32; i++ {
+	var (
+		chunks  = bintrie.ChunkifyCode(code)
+		emitted []bintrie.IndexedChunk
+	)
+	for i := range len(chunks) / 32 {
 		var chunk [32]byte
 		copy(chunk[:], chunks[32*i:32*(i+1)])
+		if chunk != ([32]byte{}) {
+			emitted = append(emitted, bintrie.IndexedChunk{Index: uint64(i), Chunk: chunk})
+		}
 		if err := emit(bintrie.CodeChunkKey(codeHash, uint64(i)), chunk); err != nil {
 			return err
 		}
 	}
-	return nil
+	_, err := bintrie.AssembleCode(codeHash, uint32(len(code)), emitted)
+	return err
 }
 
 // hasBinaryTrieState reports whether anything sits in the binary tree

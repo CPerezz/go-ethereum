@@ -684,101 +684,46 @@ func TestConvertCorruptPreimageRefused(t *testing.T) {
 
 // raw-namespace cursors and records must not outlive the state they name.
 
-// TestConvertDetectsLostRecords pins the check that ties a conversion's
-// output to its input. The converter's dual-check joins its own leaves to
-// candidates from the same scan, so a record the scan loses goes missing from
-// both and the join stays consistent: only check 2, re-deriving the source
-// root from the leaves, can catch it.
+// TestConvertDetectsLostRecords pins what ties a self-conversion's output to
+// its input. A record the scan loses goes missing from its leaves and from
+// the merkle state it folds alike, which then misses the source root; a leaf
+// lost on the way from the scan to the tree breaks the multiset match.
 func TestConvertDetectsLostRecords(t *testing.T) {
 	alloc := artifactAlloc()
-
-	chaindb := rawdb.NewMemoryDatabase()
-	srcTriedb := triedb.NewDatabase(chaindb, &triedb.Config{
-		Preimages: true,
-		PathDB:    pathdb.Defaults,
-	})
-	gspec := &core.Genesis{
-		Config:  params.TestChainConfig,
-		BaseFee: big.NewInt(params.InitialBaseFee),
-		Alloc:   alloc,
-	}
-	root := gspec.MustCommit(chaindb, srcTriedb).Root()
-	srcTriedb.Close()
-
-	// scan derives the leaves and candidates deriveLeaves would, minus what
-	// drop rejects: the account for (addr, nil), a slot for (addr, &key).
-	scan := func(t *testing.T, drop func(addr common.Address, slot *common.Hash) bool) *ownLeaves {
-		t.Helper()
-		leaves := bintrie.NewLeafSorter(t.TempDir(), 0)
-		cands := bintrie.NewRecordSorter(t.TempDir(), 0, nil)
-		t.Cleanup(func() {
-			leaves.Close()
-			cands.Close()
-		})
-		emit := func(key []byte, value [32]byte) error {
-			if value == ([32]byte{}) {
-				return nil
-			}
-			return leaves.Add(key, value[:])
-		}
-		codes, stats := newCodeSet(), newStats("Scanning")
-		for addr, account := range alloc {
-			if drop != nil && drop(addr, nil) {
-				continue
-			}
-			codeHash := types.EmptyCodeHash
-			if len(account.Code) != 0 {
-				codeHash = crypto.Keccak256Hash(account.Code)
-			}
-			balance := new(uint256.Int)
-			if account.Balance != nil {
-				balance = uint256.MustFromBig(account.Balance)
-			}
-			if err := emitAccountHeader(chaindb, addr, account.Nonce, balance, codeHash, codes, stats, emit); err != nil {
-				t.Fatal(err)
-			}
-			c := accountCandidates{cand: cands, buf: new(candidateBuf), addr: addr, addrHash: crypto.Keccak256Hash(addr[:])}
-			for key, value := range account.Storage {
-				if (drop != nil && drop(addr, &key)) || value == (common.Hash{}) {
-					continue
-				}
-				if err := emit(bintrie.StorageSlotKey(addr, key[:]), value); err != nil {
-					t.Fatal(err)
-				}
-				if err := c.slot(key, crypto.Keccak256Hash(key[:])); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := c.finish(); err != nil {
-				t.Fatal(err)
-			}
-		}
-		stream, err := leaves.Sort()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return &ownLeaves{leaves: stream, candidates: cands}
-	}
-	convert := func(t *testing.T, own *ownLeaves) (ethdb.Database, error) {
-		db := rawdb.NewMemoryDatabase()
-		_, err := importState(context.Background(), db, importOptions{own: own,
-			anchor:            &types.Header{Number: big.NewInt(1), Root: root},
-			conversionOptions: conversionOptions{tmpDir: t.TempDir()}})
-		return db, err
-	}
-
-	// The account holding storage, so both loss cases land on it.
+	// The account holding storage, so both scan losses land on it.
 	var (
 		victim   = common.HexToAddress("0x2000000000000000000000000000000000000002")
-		slotOne  = common.BigToHash(big.NewInt(1))
+		lostHash = crypto.Keccak256Hash(victim[:])
+		lostSlot = crypto.Keccak256Hash(common.BigToHash(big.NewInt(1)).Bytes())
 		mismatch = "re-derive merkle root"
 	)
 	if _, ok := alloc[victim]; !ok {
 		t.Fatalf("fixture no longer holds %x", victim)
 	}
-
+	// convert self-converts the fixture with a scan that misses what drop
+	// rejects: an account for (hash, nil), a slot for (hash, &slot).
+	convert := func(t *testing.T, drop func(account common.Hash, slot *common.Hash) bool) (ethdb.Database, error) {
+		chaindb := rawdb.NewMemoryDatabase()
+		srcTriedb := triedb.NewDatabase(chaindb, &triedb.Config{Preimages: true, PathDB: pathdb.Defaults})
+		gspec := &core.Genesis{Config: params.TestChainConfig, BaseFee: big.NewInt(params.InitialBaseFee), Alloc: alloc}
+		root := gspec.MustCommit(chaindb, srcTriedb).Root()
+		srcTriedb.Close()
+		src := triedb.NewDatabase(chaindb, &triedb.Config{Preimages: true, PathDB: pathdb.ReadOnly})
+		defer src.Close()
+		opts := conversionOptions{tmpDir: t.TempDir(), anchor: &types.Header{Number: big.NewInt(1), Root: root}}
+		plan, file, err := triedbPlan(src, root, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		for i, s := range plan.sources {
+			plan.sources[i] = droppingSource{s, drop}
+		}
+		_, err = convertPlan(context.Background(), chaindb, plan, opts)
+		return chaindb, err
+	}
 	t.Run("complete set", func(t *testing.T) {
-		db, err := convert(t, scan(t, nil))
+		db, err := convert(t, func(common.Hash, *common.Hash) bool { return false })
 		if err != nil {
 			t.Fatalf("the complete leaf set failed the dual-check: %v", err)
 		}
@@ -786,11 +731,8 @@ func TestConvertDetectsLostRecords(t *testing.T) {
 			t.Fatal("a passing conversion attested nothing")
 		}
 	})
-
 	t.Run("lost account", func(t *testing.T) {
-		db, err := convert(t, scan(t, func(addr common.Address, _ *common.Hash) bool {
-			return addr == victim
-		}))
+		db, err := convert(t, func(account common.Hash, slot *common.Hash) bool { return account == lostHash && slot == nil })
 		if err == nil || !strings.Contains(err.Error(), mismatch) {
 			t.Fatalf("a dropped account survived check 2; err = %v", err)
 		}
@@ -798,11 +740,10 @@ func TestConvertDetectsLostRecords(t *testing.T) {
 			t.Fatal("a refused conversion attested its namespace")
 		}
 	})
-
 	t.Run("lost slot", func(t *testing.T) {
-		db, err := convert(t, scan(t, func(addr common.Address, slot *common.Hash) bool {
-			return addr == victim && slot != nil && *slot == slotOne
-		}))
+		db, err := convert(t, func(account common.Hash, slot *common.Hash) bool {
+			return account == lostHash && slot != nil && *slot == lostSlot
+		})
 		if err == nil || !strings.Contains(err.Error(), mismatch) {
 			t.Fatalf("a dropped storage slot survived check 2; err = %v", err)
 		}
@@ -810,4 +751,84 @@ func TestConvertDetectsLostRecords(t *testing.T) {
 			t.Fatal("a refused conversion attested its namespace")
 		}
 	})
+	t.Run("lost leaf", func(t *testing.T) {
+		sorter := bintrie.NewLeafSorter(t.TempDir(), 0)
+		defer sorter.Close()
+		var emitted leafSum
+		for i := range 50 {
+			key, value := bintrie.BasicDataKey(common.Address{byte(i + 1)}), [32]byte{31: byte(i + 1)}
+			if err := sorter.Add(key, value[:]); err != nil {
+				t.Fatal(err)
+			}
+			emitted.add(key, value[:])
+		}
+		stream, err := sorter.Sort()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = buildOwnTree(context.Background(), rawdb.NewMemoryDatabase(), &skipLeaf{leafReader: streamLeaves{stream}, lost: 17}, &emitted, conversionOptions{tmpDir: t.TempDir()})
+		if err == nil || !strings.Contains(err.Error(), "other leaves than the scan derived") {
+			t.Fatalf("a leaf lost before the build went unnoticed; err = %v", err)
+		}
+	})
+}
+
+// droppingSource is a leaf source missing what drop rejects.
+type droppingSource struct {
+	leafSource
+	drop func(account common.Hash, slot *common.Hash) bool
+}
+
+func (s droppingSource) accounts(seek common.Hash) (pathdb.AccountIterator, error) {
+	it, err := s.leafSource.accounts(seek)
+	return &droppingAccounts{it, s.drop}, err
+}
+
+func (s droppingSource) storage(accountHash, root common.Hash) (pathdb.StorageIterator, error) {
+	it, err := s.leafSource.storage(accountHash, root)
+	return &droppingSlots{it, accountHash, s.drop}, err
+}
+
+type droppingAccounts struct {
+	pathdb.AccountIterator
+	drop func(account common.Hash, slot *common.Hash) bool
+}
+
+func (d *droppingAccounts) Next() bool {
+	for d.AccountIterator.Next() {
+		if !d.drop(d.Hash(), nil) {
+			return true
+		}
+	}
+	return false
+}
+
+type droppingSlots struct {
+	pathdb.StorageIterator
+	account common.Hash
+	drop    func(account common.Hash, slot *common.Hash) bool
+}
+
+func (d *droppingSlots) Next() bool {
+	for d.StorageIterator.Next() {
+		if hash := d.Hash(); !d.drop(d.account, &hash) {
+			return true
+		}
+	}
+	return false
+}
+
+// skipLeaf is a leaf reader losing the leaf at index lost.
+type skipLeaf struct {
+	leafReader
+	lost, at int
+}
+
+func (s *skipLeaf) next() ([]byte, [32]byte, error) {
+	if s.at++; s.at-1 == s.lost {
+		if _, _, err := s.leafReader.next(); err != nil {
+			return nil, [32]byte{}, err
+		}
+	}
+	return s.leafReader.next()
 }

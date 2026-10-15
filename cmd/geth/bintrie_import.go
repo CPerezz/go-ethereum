@@ -500,36 +500,14 @@ var headerSlotHashes = func() (hashes [bintrie.HeaderStorageSlots]common.Hash) {
 
 // importOptions carries an import's inputs: the two artifacts, the anchor
 // whose header the state is proven against, and the conversion tunables the
-// two commands share. A self-converter sets own instead of the artifacts.
+// two commands share.
 type importOptions struct {
 	snapshot      string
 	preimages     string
 	anchor        *types.Header
 	verifyOnly    bool
 	keepPreimages bool
-	own           *ownLeaves
 	conversionOptions
-}
-
-// ownLeaves carries a self-converter's leaves and join candidates into the
-// import in place of the artifacts. EIP-8347 has a self-converter run check 2
-// and its code limb over the leaves it derived, but not check 1: its build is
-// the tree, and the only claimed root is the one that build computes. Its
-// code store holds its code already, so none is written.
-type ownLeaves struct {
-	leaves     *bintrie.RecordStream // in tree-key order
-	candidates *bintrie.RecordSorter // derived by the scan, see accountCandidates
-	count      atomic.Uint64         // leaves handed out, for progress
-}
-
-// next hands the leaf pipeline the conversion's next leaf.
-func (o *ownLeaves) next() ([]byte, [32]byte, error) {
-	key, value, err := o.leaves.Next()
-	if err != nil {
-		return nil, [32]byte{}, err
-	}
-	o.count.Add(1)
-	return key, [32]byte(value), nil
 }
 
 // importState verifies and ingests the artifacts, returning the imported
@@ -539,7 +517,6 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	var (
 		anchorRoot = opts.anchor.Root
 		verifyOnly = opts.verifyOnly
-		own        = opts.own
 	)
 	pbtdb := rawdb.NewTable(chaindb, string(rawdb.PBTPrefix))
 	if !verifyOnly {
@@ -560,33 +537,24 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	quarter := opts.sortBudget / 4
 
 	// Open both artifacts before the expensive phase: a mistyped path should
-	// not cost a full pass over the other file. A self-converter has none.
-	var (
-		pre    *preimageReader
-		snap   *snapshotReader
-		leaves leafReader = own
-		err    error
-	)
-	if own == nil {
-		if pre, err = openPreimages(opts.preimages); err != nil {
-			return common.Hash{}, err
-		}
-		defer pre.close()
-		if snap, err = openSnapshot(opts.snapshot); err != nil {
-			return common.Hash{}, err
-		}
-		defer snap.close()
-		leaves = snap
+	// not cost a full pass over the other file.
+	pre, err := openPreimages(opts.preimages)
+	if err != nil {
+		return common.Hash{}, err
 	}
+	defer pre.close()
+	snap, err := openSnapshot(opts.snapshot)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	defer snap.close()
 	var (
 		rawBatch ethdb.Batch    // code and preimages, outside the namespace
 		flatdb   ethdb.Database // check 2 writes the flat state into its namespace
 	)
 	if !verifyOnly {
 		flatdb = chaindb
-		if own == nil {
-			rawBatch = chaindb.NewBatch()
-		}
+		rawBatch = chaindb.NewBatch()
 	}
 	flush := func(force bool) error {
 		if rawBatch == nil || (!force && rawBatch.ValueSize() < ethdb.IdealBatchSize) {
@@ -599,12 +567,9 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		return nil
 	}
 
-	// Phase 1: every candidate tree key the preimages can stand for, from
-	// the preimage file, or from the keys a self-converter's scan resolved.
-	var cand *bintrie.RecordSorter
-	if own != nil {
-		cand = own.candidates
-	} else if cand, err = preimageCandidates(ctx, pre, rawBatch, flush, opts); err != nil {
+	// Phase 1: every candidate tree key the preimages can stand for.
+	cand, err := preimageCandidates(ctx, pre, rawBatch, flush, opts)
+	if err != nil {
 		return common.Hash{}, err
 	}
 	defer cand.Close() // a second Close is a no-op; this one covers the error paths
@@ -612,12 +577,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// Phase 2: stream the leaves; rebuild the tree; join every account and
 	// storage leaf to its preimage candidate; collect the MPT re-derivation
 	// inputs.
-	var prog *progress
-	if own == nil {
-		prog = startProgress("Verifying snapshot", "bytes", uint64(snap.size), snap.read.Load)
-	} else {
-		prog = startProgress("Building the binary tree", "leaves", 0, own.count.Load)
-	}
+	prog := startProgress("Verifying snapshot", "bytes", uint64(snap.size), snap.read.Load)
 	defer prog.stop()
 	candStream, err := cand.Sort()
 	if err != nil {
@@ -805,7 +765,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// The pass is a pipeline: a decoder goroutine reads the snapshot into
 	// batches, which the tree builder's goroutine and this loop each consume
 	// in order, so decoding, hashing and joining overlap.
-	pipe := startLeafPipeline(leaves, builder)
+	pipe := startLeafPipeline(snap, builder)
 	defer pipe.stop()
 	var (
 		batch *leafBatch
@@ -965,17 +925,12 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// snapshot that never left the account zone needs none built.
 	cand.Close()
 
-	// Check 1: the leaves must rebuild to the claimed root. A self-converter
-	// claims none: its build is the tree.
+	// Check 1: the leaves must rebuild to the claimed root.
 	root := builder.Finish()
-	if own == nil {
-		if root != snap.root {
-			return common.Hash{}, fmt.Errorf("snapshot leaves rebuild to %x, its pbtRoot claims %x", root, snap.root)
-		}
-		prog.finish("Verified snapshot consistency", "root", root, "leaves", stats.leaves.Load(), "digest", snap.digest())
-	} else {
-		prog.finish("Built the binary tree", "root", root, "leaves", stats.leaves.Load())
+	if root != snap.root {
+		return common.Hash{}, fmt.Errorf("snapshot leaves rebuild to %x, its pbtRoot claims %x", root, snap.root)
 	}
+	prog.finish("Verified snapshot consistency", "root", root, "leaves", stats.leaves.Load(), "digest", snap.digest())
 	var (
 		written  = newWrittenState()
 		readBack errgroup.Group
@@ -1083,28 +1038,34 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		return common.Hash{}, err
 	}
 	logWritten(written)
-	// A cancelled import never attests, however far it got: an interrupted
-	// run is redone from scratch, never half-trusted.
-	if err := ctx.Err(); err != nil {
+	if err := attestTree(ctx, pbtdb, root, opts.anchor, opts.beforeAttest); err != nil {
 		return common.Hash{}, err
 	}
-	if opts.beforeAttest != nil {
-		if err := opts.beforeAttest(); err != nil {
-			return common.Hash{}, err
+	log.Info("Import complete", "binaryRoot", root, "anchor", opts.anchor.Number,
+		"snapshotDigest", snap.digest(), "preimageDigest", pre.digest())
+	return root, nil
+}
+
+// attestTree attests the tree at root in pbtdb, anchored at anchor, once
+// beforeAttest, if set, agrees. A cancelled run never attests, however far
+// it got: an interrupted one is redone from scratch, never half-trusted.
+func attestTree(ctx context.Context, pbtdb ethdb.KeyValueWriter, root common.Hash, anchor *types.Header, beforeAttest func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if beforeAttest != nil {
+		if err := beforeAttest(); err != nil {
+			return err
 		}
 	}
 	// The anchor rides with the root: the tree does not say which block it
 	// commits, and catching up from here has to start somewhere. The
-	// attestation is the completion marker and comes last; the imported tree
-	// bases an empty history, like a conversion.
+	// attestation is the completion marker and comes last; the tree bases an
+	// empty history.
 	rawdb.WriteSnapshotRoot(pbtdb, root)
-	rawdb.WritePBTAnchor(pbtdb, opts.anchor.Number.Uint64(), opts.anchor.Hash())
+	rawdb.WritePBTAnchor(pbtdb, anchor.Number.Uint64(), anchor.Hash())
 	rawdb.WritePBTFlatState(pbtdb)
-	if own == nil {
-		log.Info("Import complete", "binaryRoot", root, "anchor", opts.anchor.Number,
-			"snapshotDigest", snap.digest(), "preimageDigest", pre.digest())
-	}
-	return root, nil
+	return nil
 }
 
 // preimageCandidates derives every candidate tree key the preimage file can

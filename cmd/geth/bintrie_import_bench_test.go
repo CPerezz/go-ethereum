@@ -129,7 +129,7 @@ func benchSize(b *testing.B, kind string) (string, int) {
 var selfConvertMarks = []struct{ msg, name string }{
 	{"Converting state", "scan"},
 	{"Built the binary tree", "build"},
-	{"Verified code against its hashes", "code"},
+	{"Wrote tree nodes", "nodes"},
 	{"Verified consensus anchoring", "check2"},
 }
 
