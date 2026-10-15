@@ -108,6 +108,30 @@ type KeyValueStore interface {
 	io.Closer
 }
 
+// TableWriter builds one sorted table file for TableIngester.Ingest.
+type TableWriter interface {
+	// Put appends a record. Keys must strictly ascend.
+	Put(key []byte, value []byte) error
+
+	// Close finishes the table file. It must be called even after a failed Put,
+	// to release the file.
+	Close() error
+}
+
+// TableIngester is an optional interface of key-value stores that can adopt
+// externally built sorted tables, bypassing the write-ahead log and memtables.
+// Callers type-assert for it and fall back to batches otherwise.
+type TableIngester interface {
+	// NewTableWriter creates a table file at path, in the store's own format.
+	NewTableWriter(path string) (TableWriter, error)
+
+	// Ingest atomically adds the closed tables at paths to the store. The key
+	// ranges of the tables must not overlap each other; touching bounds count
+	// as overlap. The files are consumed whether or not it succeeds. Tables on
+	// the store's filesystem are linked in rather than copied.
+	Ingest(paths []string) error
+}
+
 // AncientReaderOp contains the methods required to read from immutable ancient data.
 type AncientReaderOp interface {
 	// Ancient retrieves an ancient binary blob from the append-only immutable files.

@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -29,6 +30,9 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
+	"github.com/cockroachdb/pebble/v2/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/v2/sstable"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
@@ -107,6 +111,7 @@ type Database struct {
 	writeDelayTime      atomic.Int64 // Total time spent in write stalls
 
 	writeOptions *pebble.WriteOptions
+	opts         *pebble.Options // the defaulted options Open used, for NewTableWriter
 }
 
 func (d *Database) onCompactionBegin(info pebble.CompactionInfo) {
@@ -334,6 +339,11 @@ func New(file string, cache int, handles int, namespace string, readonly bool) (
 	opt.Experimental.L0CompactionConcurrency = 1
 	opt.Experimental.CompactionDebtConcurrency = 1 << 28 // 256MB
 
+	// Open applies the defaults to a clone of opt; NewTableWriter needs the
+	// same block and filter settings for the tables it builds.
+	opt.EnsureDefaults()
+	db.opts = opt
+
 	// Open the db and recover any potential corruptions
 	innerDB, err := pebble.Open(file, opt)
 	if err != nil {
@@ -532,6 +542,53 @@ func (d *Database) Compact(start []byte, limit []byte) error {
 // Path returns the path to the database directory.
 func (d *Database) Path() string {
 	return d.fn
+}
+
+// tableWriter adapts an sstable.Writer to ethdb.TableWriter.
+type tableWriter struct {
+	w *sstable.Writer
+}
+
+// Put appends a record; the writer copies key and value before returning.
+func (t *tableWriter) Put(key, value []byte) error {
+	return t.w.Set(key, value)
+}
+
+// Close finishes the table file.
+func (t *tableWriter) Close() error {
+	return t.w.Close()
+}
+
+// NewTableWriter creates a sorted table file at path for a later Ingest, in
+// the database's table format with level 0's block and filter options: the
+// ones every level but the last shares, and an ingested table may land
+// above the last.
+func (d *Database) NewTableWriter(path string) (ethdb.TableWriter, error) {
+	f, err := vfs.Default.Create(path, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		return nil, err
+	}
+	w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), d.opts.MakeWriterOptions(0, d.db.TableFormat()))
+	return &tableWriter{w: w}, nil
+}
+
+// Ingest atomically adds the closed tables at paths to the database,
+// bypassing the write-ahead log and memtables. On success pebble links (or,
+// across filesystems, copies) the files in and removes them; on failure it
+// leaves them, so this removes them itself.
+func (d *Database) Ingest(paths []string) error {
+	d.quitLock.RLock()
+	defer d.quitLock.RUnlock()
+	if d.closed {
+		return pebble.ErrClosed
+	}
+	if err := d.db.Ingest(context.Background(), paths); err != nil {
+		for _, p := range paths {
+			os.Remove(p)
+		}
+		return err
+	}
+	return nil
 }
 
 // SyncKeyValue flushes all pending writes in the write-ahead-log to disk,
