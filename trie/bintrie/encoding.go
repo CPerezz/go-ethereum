@@ -112,16 +112,20 @@ func appendNodeErr(dst []byte, n binaryNode, pos int) ([]byte, error) {
 		}
 		return blob, nil
 	case *branchNode:
-		blob := slices.Grow(dst, 1+2+len(n.prefix.b)+64)
-		blob = append(blob, tagBranch)
-		blob = appendBitPrefix(blob, n.prefix)
 		child := pos + n.prefix.n + 1
-		left, right := n.left.hashAt(child), n.right.hashAt(child)
-		blob = append(blob, left[:]...)
-		return append(blob, right[:]...), nil
+		return appendBranchBlob(slices.Grow(dst, 1+2+len(n.prefix.b)+64), n.prefix, n.left.hashAt(child), n.right.hashAt(child)), nil
 	default:
 		return nil, fmt.Errorf("bintrie: cannot serialize node type %T", n)
 	}
+}
+
+// appendBranchBlob appends the record of a branch with the given prefix and
+// child hashes to dst.
+func appendBranchBlob(dst []byte, prefix bitstr, left, right common.Hash) []byte {
+	dst = append(dst, tagBranch)
+	dst = appendBitPrefix(dst, prefix)
+	dst = append(dst, left[:]...)
+	return append(dst, right[:]...)
 }
 
 // decodeNode parses a database record into a node. Branch children decode to
