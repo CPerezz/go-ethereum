@@ -737,7 +737,7 @@ func TestConvertDetectsLostRecords(t *testing.T) {
 			if err := emitAccountHeader(chaindb, addr, account.Nonce, balance, codeHash, codes, stats, emit); err != nil {
 				t.Fatal(err)
 			}
-			c := accountCandidates{cand: cands, buf: new(candidateBuf), addr: addr}
+			c := accountCandidates{cand: cands, buf: new(candidateBuf), addr: addr, addrHash: crypto.Keccak256Hash(addr[:])}
 			for key, value := range account.Storage {
 				if (drop != nil && drop(addr, &key)) || value == (common.Hash{}) {
 					continue
@@ -745,7 +745,7 @@ func TestConvertDetectsLostRecords(t *testing.T) {
 				if err := emit(bintrie.StorageSlotKey(addr, key[:]), value); err != nil {
 					t.Fatal(err)
 				}
-				if err := c.slot(key); err != nil {
+				if err := c.slot(key, crypto.Keccak256Hash(key[:])); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -857,7 +857,7 @@ func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, p
 			}
 			// A zero slot emits no leaf, so it may claim no key either.
 			if cands != nil && padded != ([32]byte{}) {
-				if err := cands.slot(slotKey); err != nil {
+				if err := cands.slot(slotKey, slotHash); err != nil {
 					return err
 				}
 			}
@@ -897,7 +897,7 @@ func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, p
 		}
 		var cands *accountCandidates
 		if part.cands != nil {
-			cands = &accountCandidates{cand: part.cands, buf: &candBuf, addr: addr}
+			cands = &accountCandidates{cand: part.cands, buf: &candBuf, addr: addr, addrHash: accountHash}
 		}
 		if acc.Root != types.EmptyRootHash {
 			if err := scanStorage(accountHash, addr, acc.Root, cands); err != nil {
