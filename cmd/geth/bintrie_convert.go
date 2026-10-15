@@ -412,7 +412,8 @@ func exportArtifacts(ctx context.Context, chaindb ethdb.Database, srcTriedb *tri
 	var written atomic.Uint64
 	prog := startProgress("Writing PBT snapshot", "leaves", stats.leaves.Load(), written.Load)
 	defer prog.stop()
-	builder := bintrie.NewStackBuilder(nil)
+	builder := bintrie.NewParallelStackBuilder(nil, opts.workers)
+	defer builder.Stop()
 	for {
 		key, value, err := stream.Next()
 		if err == io.EOF {
