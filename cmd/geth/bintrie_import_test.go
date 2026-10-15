@@ -37,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
@@ -149,6 +150,56 @@ func assertNamespaceEqual(t *testing.T, want, got ethdb.Database) {
 		for key, value := range w {
 			if !bytes.Equal(g[key], value) {
 				t.Fatalf("family %x record %x diverges", family, key)
+			}
+		}
+	}
+}
+
+// TestImportDiskBacked imports into a pebble database, so the namespace is
+// written by table ingest, which a memory database never takes: the checks
+// hash leaves in memory, so a wrong key on that path would only show as a
+// namespace that reads back differently or not at all.
+func TestImportDiskBacked(t *testing.T) {
+	alloc := mixedAlloc(8347)
+	convDB, root, binRoot, snapPath, prePath := importFixture(t, alloc)
+
+	datadir := t.TempDir()
+	kv, err := pebble.New(filepath.Join(datadir, "chaindata"), 0, 0, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := rawdb.Open(kv, rawdb.OpenOptions{Ancient: filepath.Join(datadir, "ancient")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, ok := rawdb.KeyValueStoreOf(db).(ethdb.TableIngester); !ok {
+		t.Fatal("a pebble database does not ingest tables")
+	}
+	imported, err := importState(context.Background(), db, importOptions{snapshot: snapPath, preimages: prePath,
+		anchor: &types.Header{Number: big.NewInt(7), Root: root}, conversionOptions: conversionOptions{tmpDir: t.TempDir()}})
+	if err != nil {
+		t.Fatalf("import failed: %v", err)
+	}
+	if imported != binRoot {
+		t.Fatalf("imported root %x, the converter built %x", imported, binRoot)
+	}
+	assertNamespaceEqual(t, convDB, db)
+
+	// The state reads through the stack a node uses, off the ingested tables.
+	tdb := triedb.NewDatabase(db, &triedb.Config{IsPBT: true, PathDB: pathdb.Defaults})
+	defer tdb.Close()
+	statedb, err := state.New(imported, state.NewPBTDatabase(tdb, state.NewCodeDB(db)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for addr, acct := range alloc {
+		if got := statedb.GetNonce(addr); got != acct.Nonce {
+			t.Fatalf("account %x nonce %d, want %d", addr, got, acct.Nonce)
+		}
+		for slot, value := range acct.Storage {
+			if got := statedb.GetState(addr, slot); got != value {
+				t.Fatalf("slot %x of %x reads %x, want %x", slot, addr, got, value)
 			}
 		}
 	}

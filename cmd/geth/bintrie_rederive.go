@@ -87,12 +87,12 @@ func (h *heldStream) advance() { h.key, h.value = nil, nil }
 //
 // The calling goroutine walks both streams in keccak order; workers fold the
 // storage tries and one more goroutine the account trie, taking the storage
-// roots in account order. With a batch, the walk also writes the flat state:
-// storage rows as it goes, account rows spilled to a file under tmpDir and
-// written after the last storage row, so no flushed table mixes the two key
-// families. Everything is written by return, batch included, and digested
-// into written.
-func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStream, batch ethdb.Batch, written *writtenState, tmpDir string, workers int, total uint64) (common.Hash, error) {
+// roots in account order. With a database, the walk also writes the flat
+// state into its namespace: storage rows as it goes, account rows spilled to
+// a file under tmpDir and written after the last storage row, so no flushed
+// table mixes the two key families. Everything is written by return and
+// digested into written.
+func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStream, db ethdb.Database, written *writtenState, tmpDir string, workers int, total uint64) (common.Hash, error) {
 	workers = max(workers, 1)
 	var (
 		g, gctx   = errgroup.WithContext(ctx)
@@ -125,7 +125,7 @@ func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStre
 			}
 			close(accts)
 		}()
-		return walkMerkleRecords(gctx, accounts, slots, batch, written, tmpDir, total, jobs, free, accts, acctsFree)
+		return walkMerkleRecords(gctx, accounts, slots, db, written, tmpDir, total, jobs, free, accts, acctsFree)
 	})
 	if err := g.Wait(); err != nil {
 		return common.Hash{}, err
@@ -158,16 +158,17 @@ type foldAccount struct {
 }
 
 // walkMerkleRecords joins the account and slot streams in keccak order,
-// writing the flat state if batch is set, and hands the slots to the fold
+// writing the flat state if db is set, and hands the slots to the fold
 // workers and the accounts to the account trie: a job of whole accounts to
 // one worker, the next job to the next. total is the accounts and slots
 // expected, for progress reports.
-func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStream, batch ethdb.Batch, written *writtenState, tmpDir string, total uint64,
+func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStream, db ethdb.Database, written *writtenState, tmpDir string, total uint64,
 	jobs []chan *foldBatch, free chan *foldBatch, accts, acctsFree chan []foldAccount) error {
 	var (
 		slotHeld   = &heldStream{stream: slots}
 		walked     atomic.Uint64 // accounts and slots
 		walkedAccs uint64
+		batch      nsWriter
 		acctRows   *spillFile
 		storageSum *digestAhead
 		worker     int
@@ -176,7 +177,7 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 	)
 	prog := startProgress("Re-deriving merkle state", "records", total, walked.Load)
 	defer prog.stop()
-	if batch != nil {
+	if db != nil {
 		var err error
 		if acctRows, err = newSpillFile(tmpDir, "bintrie-acctrows-*"); err != nil {
 			return err
@@ -184,16 +185,10 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 		defer acctRows.close()
 		storageSum = written.storage.ahead()
 		defer storageSum.finish()
-	}
-	flush := func() error {
-		if batch.ValueSize() < ethdb.IdealBatchSize {
-			return nil
-		}
-		if err := batch.Write(); err != nil {
+		if batch, err = newNamespaceWriter(db, tmpDir); err != nil {
 			return err
 		}
-		batch.Reset()
-		return nil
+		defer func() { batch.close() }() // the storage's writer, then the accounts'
 	}
 	take := func() error {
 		select {
@@ -273,8 +268,10 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 				cur.ends = append(cur.ends, len(cur.vals))
 				if batch != nil {
 					storageSum.add(skey, svalue)
-					rawdb.WriteStorageSnapshot(batch, acct.hash, common.BytesToHash(skey[common.HashLength:]), svalue)
-					if err := flush(); err != nil {
+					if err := batch.put(rawdb.SnapshotStoragePrefix, acct.hash[:], skey[common.HashLength:], svalue); err != nil {
+						return err
+					}
+					if err := batch.flush(); err != nil {
 						return err
 					}
 				}
@@ -348,10 +345,9 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 	if err := storageSum.finish(); err != nil {
 		return err
 	}
-	if err := batch.Write(); err != nil {
+	if err := batch.close(); err != nil {
 		return err
 	}
-	batch.Reset()
 	if written.storageWritten != nil {
 		written.storageWritten()
 	}
@@ -360,15 +356,21 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 	defer prog.stop()
 	accountSum := written.accounts.ahead()
 	defer accountSum.finish()
-	err := acctRows.replay(bufio.NewReaderSize(nil, 256<<10), func(hash, row []byte) error {
+	batch, err := newNamespaceWriter(db, tmpDir)
+	if err != nil {
+		return err
+	}
+	err = acctRows.replay(bufio.NewReaderSize(nil, 256<<10), func(hash, row []byte) error {
 		accountSum.add(hash, row)
-		rawdb.WriteAccountSnapshot(batch, common.BytesToHash(hash), row)
+		if err := batch.put(rawdb.SnapshotAccountPrefix, hash, nil, row); err != nil {
+			return err
+		}
 		if rows.Add(1)%uint64(foldBatchSize) == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		return flush()
+		return batch.flush()
 	})
 	if err != nil {
 		return err
@@ -376,10 +378,9 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 	if err := accountSum.finish(); err != nil {
 		return err
 	}
-	if err := batch.Write(); err != nil {
+	if err := batch.close(); err != nil {
 		return err
 	}
-	batch.Reset()
 	prog.finish("Wrote flat accounts", "accounts", rows.Load())
 	return nil
 }
@@ -674,34 +675,34 @@ func (w *writtenState) families() []writtenFamily {
 	}
 }
 
-// writeStagedNodes writes the staged tree nodes into the namespace in key
-// order, digesting each.
-func writeStagedNodes(ctx context.Context, pbtdb ethdb.Database, nodes *nodeStager, digest *writeDigest) error {
+// writeStagedNodes writes the staged tree nodes into db's binary tree
+// namespace in key order, digesting each.
+func writeStagedNodes(ctx context.Context, db ethdb.Database, tmpDir string, nodes *nodeStager, digest *writeDigest) error {
+	batch, err := newNamespaceWriter(db, tmpDir)
+	if err != nil {
+		return err
+	}
 	var (
-		batch   = pbtdb.NewBatch()
 		ahead   = digest.ahead()
 		staged  uint64
 		flushed atomic.Uint64
 		prog    = startProgress("Writing tree nodes", "nodes", nodes.count, flushed.Load)
 	)
+	defer batch.close()
 	defer ahead.finish()
 	defer prog.stop()
-	err := nodes.replay(func(path, blob []byte) error {
+	err = nodes.replay(func(path, blob []byte) error {
 		ahead.add(path, blob)
-		rawdb.WriteAccountTrieNode(batch, path, blob)
-		staged++
-		if batch.ValueSize() < ethdb.IdealBatchSize {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
+		if err := batch.put(rawdb.TrieNodeAccountPrefix, path, nil, blob); err != nil {
 			return err
 		}
-		if err := batch.Write(); err != nil {
-			return err
+		if staged++; staged%recordBatchSize == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			flushed.Store(staged)
 		}
-		batch.Reset()
-		flushed.Store(staged)
-		return nil
+		return batch.flush()
 	})
 	if err != nil {
 		return err
@@ -709,7 +710,7 @@ func writeStagedNodes(ctx context.Context, pbtdb ethdb.Database, nodes *nodeStag
 	if err := ahead.finish(); err != nil {
 		return err
 	}
-	if err := batch.Write(); err != nil {
+	if err := batch.close(); err != nil {
 		return err
 	}
 	prog.finish("Wrote tree nodes", "nodes", staged)

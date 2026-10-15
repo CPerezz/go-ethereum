@@ -491,7 +491,7 @@ func convertState(chaindb ethdb.Database, srcTriedb *triedb.Database, root commo
 	// record set, so only this check ties the output to the source state.
 	// The fold writes the flat state as it goes, digesting what it writes.
 	written := newWrittenState()
-	if err := verifySourceRoot(accounts, slots, root, pbtdb.NewBatch(), written, opts.tmpDir, workers, stats.accounts.Load()+stats.slots.Load()); err != nil {
+	if err := verifySourceRoot(accounts, slots, root, chaindb, written, opts.tmpDir, workers, stats.accounts.Load()+stats.slots.Load()); err != nil {
 		return common.Hash{}, err
 	}
 	accounts.Close()
@@ -534,7 +534,7 @@ func convertState(chaindb ethdb.Database, srcTriedb *triedb.Database, root commo
 		return common.Hash{}, builderErr
 	}
 	sorter.Close()
-	if err := writeStagedNodes(context.Background(), pbtdb, nodes, written.nodes); err != nil {
+	if err := writeStagedNodes(context.Background(), chaindb, opts.tmpDir, nodes, written.nodes); err != nil {
 		return common.Hash{}, err
 	}
 	nodes.close()
@@ -1118,8 +1118,8 @@ func wipeBinaryTrieState(chaindb ethdb.Database, triedbDir string) error {
 
 // verifySourceRoot demands that the scanned records re-derive the state root
 // they were read from, the converter's counterpart to the importer's anchor
-// check. With a batch it also writes the flat state, see rederiveMerkleRoot.
-func verifySourceRoot(accounts, slots *bintrie.RecordSorter, want common.Hash, batch ethdb.Batch, written *writtenState, tmpDir string, workers int, total uint64) error {
+// check. With a database it also writes the flat state, see rederiveMerkleRoot.
+func verifySourceRoot(accounts, slots *bintrie.RecordSorter, want common.Hash, db ethdb.Database, written *writtenState, tmpDir string, workers int, total uint64) error {
 	acctStream, err := accounts.Sort()
 	if err != nil {
 		return err
@@ -1128,7 +1128,7 @@ func verifySourceRoot(accounts, slots *bintrie.RecordSorter, want common.Hash, b
 	if err != nil {
 		return err
 	}
-	got, err := rederiveMerkleRoot(context.Background(), acctStream, slotStream, batch, written, tmpDir, workers, total)
+	got, err := rederiveMerkleRoot(context.Background(), acctStream, slotStream, db, written, tmpDir, workers, total)
 	if err != nil {
 		return err
 	}

@@ -92,8 +92,10 @@ so budget about twice their sum, or cap it with GOMEMLIMIT. Merging the
 sorters' spilled runs takes up to 512 KiB per run on top, at most a quarter of
 the sorter's budget once runs are many.
 
-Disk: --tmpdir holds the sort spills and a copy of every tree node until the
-import ends, so it needs disk space, not a tmpfs.
+Disk: --tmpdir holds the sort spills, a copy of every tree node until the
+import ends and the tables the namespace is ingested from, so it needs disk
+space, not a tmpfs. On the database's filesystem the tables are linked in,
+elsewhere copied.
 
 This command needs the node stopped. To import while the node keeps
 following the chain, start geth with --pbt.import.snapshot, --pbt.import.preimages
@@ -529,25 +531,21 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	}
 	defer snap.close()
 	var (
-		pbtBatch ethdb.Batch // tree nodes and flat state, inside the namespace
-		rawBatch ethdb.Batch // code and preimages, outside it
+		rawBatch ethdb.Batch    // code and preimages, outside the namespace
+		flatdb   ethdb.Database // check 2 writes the flat state into its namespace
 	)
 	if !verifyOnly {
-		pbtBatch = pbtdb.NewBatch()
+		flatdb = chaindb
 		rawBatch = chaindb.NewBatch()
 	}
 	flush := func(force bool) error {
-		for _, batch := range []ethdb.Batch{pbtBatch, rawBatch} {
-			if batch == nil {
-				continue
-			}
-			if force || batch.ValueSize() >= ethdb.IdealBatchSize {
-				if err := batch.Write(); err != nil {
-					return err
-				}
-				batch.Reset()
-			}
+		if rawBatch == nil || (!force && rawBatch.ValueSize() < ethdb.IdealBatchSize) {
+			return nil
 		}
+		if err := rawBatch.Write(); err != nil {
+			return err
+		}
+		rawBatch.Reset()
 		return nil
 	}
 
@@ -1091,7 +1089,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	)
 	defer readBack.Wait()
 	if nodes != nil {
-		if err := writeStagedNodes(ctx, pbtdb, nodes, written.nodes); err != nil {
+		if err := writeStagedNodes(ctx, chaindb, opts.tmpDir, nodes, written.nodes); err != nil {
 			return common.Hash{}, err
 		}
 		// The tree nodes are all written: read them back while the code
@@ -1168,7 +1166,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	if err != nil {
 		return common.Hash{}, err
 	}
-	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, pbtBatch, written, opts.tmpDir, opts.workers, stats.accounts.Load()+stats.slots.Load())
+	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, flatdb, written, opts.tmpDir, opts.workers, stats.accounts.Load()+stats.slots.Load())
 	if err != nil {
 		return common.Hash{}, err
 	}
