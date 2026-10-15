@@ -917,9 +917,7 @@ func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, p
 			}
 			// A zero slot emits no leaf, so the merkle state folds none.
 			if part.check != nil && padded != ([32]byte{}) {
-				if err := part.check.slot(accountHash, slotHash, padded); err != nil {
-					return err
-				}
+				part.check.slot(accountHash, slotHash, padded)
 			}
 			slots++
 		}
@@ -960,9 +958,7 @@ func deriveLeaves(ctx context.Context, chaindb ethdb.Database, src leafSource, p
 			}
 		}
 		if part.check != nil {
-			if err := part.check.account(accountHash); err != nil {
-				return err
-			}
+			part.check.account(accountHash)
 		}
 		if err := keys.done(addr); err != nil {
 			return err

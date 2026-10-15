@@ -65,22 +65,23 @@ func (s *leafSum) merge(o *leafSum) {
 	s.n += o.n
 }
 
-// selfCheck is one scan worker's share of the dual-check: it sums the leaves
-// the worker emits, folds each account's storage trie, spills the accounts
-// for the account trie, and writes the flat state of the worker's range.
+// selfCheck is one scan worker's share of the dual-check. The worker sums
+// the leaves it emits and hands the check its slots and accounts, which a
+// goroutine of the check's own folds: each account's storage trie, the
+// accounts spilled for the account trie, and the flat state of the worker's
+// range.
 type selfCheck struct {
-	sum                       leafSum
+	sum    leafSum
+	ahead  *recordsAhead
+	header [2*32 + 1]byte // the account under the scan: basic ‖ kind ‖ delegated
+	key    []byte
+
+	// The folding goroutine's.
 	storage                   *trie.StackTrie
+	slots                     bool       // the folded account's storage trie holds anything
 	accounts                  *spillFile // keccak(address) -> full account RLP, in key order
 	flat                      nsWriter
 	flatAccounts, flatStorage *digestAhead
-
-	// The account under the scan: its header leaves as emitted, and whether
-	// its storage trie holds anything.
-	basic, kind [32]byte
-	delegated   bool
-	slots       bool
-	key         []byte
 }
 
 // newSelfCheck checks the i-th of plan's ranges, writing its flat state into
@@ -95,13 +96,15 @@ func newSelfCheck(db ethdb.Database, tmpDir string, written *writtenState, i int
 		accounts.close()
 		return nil, err
 	}
-	return &selfCheck{
+	c := &selfCheck{
 		storage:      trie.NewStackTrie(nil),
 		accounts:     accounts,
 		flat:         flat,
 		flatAccounts: written.accounts.ranges[i].d.ahead(),
 		flatStorage:  written.storage.ranges[i].d.ahead(),
-	}, nil
+	}
+	c.ahead = runAhead(c.fold)
+	return c, nil
 }
 
 // leaf notes a leaf the scan emits, keeping the account header's.
@@ -112,67 +115,93 @@ func (c *selfCheck) leaf(key []byte, value [32]byte) {
 	}
 	switch key[len(key)-1] {
 	case bintrie.BasicDataLeafKey:
-		c.basic = value
+		copy(c.header[:32], value[:])
 	case bintrie.CodeHashLeafKey:
-		c.kind, c.delegated = value, false
+		copy(c.header[32:64], value[:])
 	case bintrie.DelegationLeafKey:
-		c.kind, c.delegated = value, true
+		copy(c.header[32:64], value[:])
+		c.header[64] = 1
 	}
 }
 
-// slot folds a storage slot of the account under the scan, as its leaf holds
-// it, and writes its flat-state row.
-func (c *selfCheck) slot(accountHash, slotHash common.Hash, value [32]byte) error {
-	enc, err := rlp.EncodeToBytes(common.TrimLeftZeroes(value[:]))
+// slot hands over a storage slot of the account under the scan, as its leaf
+// holds it.
+func (c *selfCheck) slot(accountHash, slotHash common.Hash, value [32]byte) {
+	c.key = append(append(c.key[:0], accountHash[:]...), slotHash[:]...)
+	c.ahead.add(c.key, value[:])
+}
+
+// account hands over the account under the scan, once its storage is.
+func (c *selfCheck) account(accountHash common.Hash) {
+	c.ahead.add(accountHash[:], c.header[:])
+	c.header = [len(c.header)]byte{}
+}
+
+// fold takes what the scan hands over, in order: a slot under keccak(address)
+// ‖ keccak(slot), an account under keccak(address).
+func (c *selfCheck) fold(key, value []byte) error {
+	if len(key) == 2*common.HashLength {
+		return c.foldSlot(key, value)
+	}
+	return c.foldAccount(key, value)
+}
+
+// foldSlot folds a storage slot into its account's trie and writes its
+// flat-state row; key is keccak(address) ‖ keccak(slot).
+func (c *selfCheck) foldSlot(key, value []byte) error {
+	enc, err := rlp.EncodeToBytes(common.TrimLeftZeroes(value))
 	if err != nil {
 		return err
 	}
-	if err := c.storage.Update(slotHash[:], enc); err != nil {
+	if err := c.storage.Update(key[common.HashLength:], enc); err != nil {
 		return err
 	}
 	c.slots = true
-	c.key = append(append(c.key[:0], accountHash[:]...), slotHash[:]...)
-	c.flatStorage.add(c.key, enc)
-	if err := c.flat.put(rawdb.SnapshotStoragePrefix, accountHash[:], slotHash[:], enc); err != nil {
+	c.flatStorage.add(key, enc)
+	if err := c.flat.put(rawdb.SnapshotStoragePrefix, key, nil, enc); err != nil {
 		return err
 	}
 	return c.flat.flush()
 }
 
-// account seals the account under the scan, from its header leaves as they
-// decode, and readies the check for the next.
-func (c *selfCheck) account(accountHash common.Hash) error {
-	_, _, nonce, balance := bintrie.DecodeBasicData(c.basic[:])
-	codeHash := common.Hash(c.kind)
-	if c.delegated {
+// foldAccount seals an account from its header leaves as they decode, spills
+// it for the account trie and writes its flat-state row.
+func (c *selfCheck) foldAccount(accountHash, header []byte) error {
+	_, _, nonce, balance := bintrie.DecodeBasicData(header[:32])
+	codeHash := common.Hash(header[32:64])
+	if header[64] == 1 {
 		// The leaf derives from a 20-byte target: its designator is always
 		// the 23-byte EIP-7702 indicator.
-		codeHash = crypto.Keccak256Hash(c.kind[:23])
+		codeHash = crypto.Keccak256Hash(header[32 : 32+23])
 	}
 	root := types.EmptyRootHash
 	if c.slots {
 		root = c.storage.Hash()
 		c.storage.Reset()
+		c.slots = false
 	}
 	full, err := rlp.EncodeToBytes(&types.StateAccount{Nonce: nonce, Balance: balance, Root: root, CodeHash: codeHash[:]})
 	if err != nil {
 		return err
 	}
-	if err := c.accounts.add(accountHash[:], full); err != nil {
+	if err := c.accounts.add(accountHash, full); err != nil {
 		return err
 	}
 	slim := types.SlimAccountRLP(types.StateAccount{Nonce: nonce, Balance: balance, Root: types.EmptyRootHash, CodeHash: codeHash[:]})
-	c.flatAccounts.add(accountHash[:], slim)
-	if err := c.flat.put(rawdb.SnapshotAccountPrefix, accountHash[:], nil, slim); err != nil {
+	c.flatAccounts.add(accountHash, slim)
+	if err := c.flat.put(rawdb.SnapshotAccountPrefix, accountHash, nil, slim); err != nil {
 		return err
 	}
-	c.basic, c.kind, c.delegated, c.slots = [32]byte{}, [32]byte{}, false, false
 	return c.flat.flush()
 }
 
-// finish writes out the worker's flat state and completes its digests.
+// finish folds what is left, writes out the worker's flat state and
+// completes its digests, returning the first error met.
 func (c *selfCheck) finish() error {
-	err := c.flatAccounts.finish()
+	err := c.ahead.finish()
+	if aerr := c.flatAccounts.finish(); err == nil {
+		err = aerr
+	}
 	if serr := c.flatStorage.finish(); err == nil {
 		err = serr
 	}
@@ -186,6 +215,60 @@ func (c *selfCheck) finish() error {
 func (c *selfCheck) close() {
 	c.finish()
 	c.accounts.close()
+}
+
+// recordsAhead hands records to a function on a goroutine of its own, in
+// order, so that the goroutine adding them only copies them.
+type recordsAhead struct {
+	work, free chan *recordBatch
+	cur        *recordBatch
+	done       chan error
+	err        error
+}
+
+// runAhead starts feeding the records handed to the returned recordsAhead to
+// fn, in order. Past fn's first error the rest are dropped; finish returns it.
+func runAhead(fn func(key, value []byte) error) *recordsAhead {
+	a := &recordsAhead{work: make(chan *recordBatch, 4), free: make(chan *recordBatch, 5), done: make(chan error, 1)}
+	for range cap(a.free) {
+		a.free <- new(recordBatch)
+	}
+	a.cur = <-a.free
+	go func() {
+		var err error
+		for b := range a.work {
+			for i := 0; err == nil && i < b.len(); i++ {
+				err = fn(b.key(i), b.value(i))
+			}
+			b.reset()
+			a.free <- b
+		}
+		a.done <- err
+	}()
+	return a
+}
+
+// add copies one record for the goroutine.
+func (a *recordsAhead) add(key, value []byte) {
+	a.cur.add(key, value)
+	if a.cur.full() {
+		a.work <- a.cur
+		a.cur = <-a.free
+	}
+}
+
+// finish waits for every record to be handled and returns the first error
+// met. Later calls return the same.
+func (a *recordsAhead) finish() error {
+	if a.work == nil {
+		return a.err
+	}
+	if a.cur.len() > 0 {
+		a.work <- a.cur
+	}
+	close(a.work)
+	a.err, a.work = <-a.done, nil
+	return a.err
 }
 
 // foldSpilledAccounts builds the account trie from every check's accounts,
