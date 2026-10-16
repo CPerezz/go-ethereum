@@ -292,8 +292,8 @@ var (
 	}
 	PBTImportWorkersFlag = &cli.IntFlag{
 		Name:     "pbt.import.workers",
-		Usage:    "Parallel workers of the background snapshot import",
-		Value:    4,
+		Usage:    "Parallel workers of the background snapshot import; more finish sooner but slow block processing",
+		Value:    1,
 		Category: flags.EthCategory,
 	}
 	PBTImportForceFlag = &cli.BoolFlag{
