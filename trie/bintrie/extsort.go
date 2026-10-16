@@ -27,6 +27,8 @@ import (
 	"math"
 	"os"
 	"slices"
+
+	"github.com/ethereum/go-ethereum/internal/pagecache"
 )
 
 // RecordSorter is an external merge-sort: records accumulate in an in-memory
@@ -214,7 +216,7 @@ func writeRun(tmpDir string, arena []byte, index []arenaRecord) (*os.File, error
 		os.Remove(f.Name())
 		return nil, err
 	}
-	w := bufio.NewWriterSize(f, 1<<20)
+	w := bufio.NewWriterSize(pagecache.NewWriter(f), 1<<20)
 	for _, rec := range index {
 		if err := writeRunRecord(w, rec.key(arena), rec.value(arena)); err != nil {
 			return discard(err)
@@ -289,7 +291,7 @@ func (s *RecordSorter) Sort() (*RecordStream, error) {
 		size = mergeBufSize(s.budget, len(s.runs))
 	)
 	for _, f := range s.runs {
-		src := &runReader{r: bufio.NewReaderSize(f, size)}
+		src := &runReader{r: bufio.NewReaderSize(pagecache.NewReader(f), size)}
 		if err := src.advance(); err != nil {
 			if err == io.EOF {
 				continue
