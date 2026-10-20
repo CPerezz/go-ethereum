@@ -28,9 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
@@ -112,8 +110,8 @@ func (h *heldStream) advance() { h.key, h.value = nil, nil }
 // roots in account order. With flat writers, the walk also writes the flat
 // state: storage rows as it goes, account rows spilled to a file under tmpDir
 // and written after the last storage row, each family through its own writer.
-// Everything is committed by return and digested into written.
-func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, written *writtenState, tmpDir string, workers int, total uint64, y *blockYield) (common.Hash, error) {
+// Everything is committed by return.
+func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, tmpDir string, workers int, total uint64, y *blockYield) (common.Hash, error) {
 	workers = max(workers, 1)
 	var (
 		g, gctx   = errgroup.WithContext(ctx)
@@ -146,7 +144,7 @@ func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStre
 			}
 			close(accts)
 		}()
-		return walkMerkleRecords(gctx, accounts, slots, flat, written, tmpDir, total, jobs, free, accts, acctsFree, y)
+		return walkMerkleRecords(gctx, accounts, slots, flat, tmpDir, total, jobs, free, accts, acctsFree, y)
 	})
 	if err := g.Wait(); err != nil {
 		return common.Hash{}, err
@@ -183,14 +181,13 @@ type foldAccount struct {
 // workers and the accounts to the account trie: a job of whole accounts to
 // one worker, the next job to the next. total is the accounts and slots
 // expected, for progress reports.
-func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, written *writtenState, tmpDir string, total uint64,
+func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, tmpDir string, total uint64,
 	jobs []chan *foldBatch, free chan *foldBatch, accts, acctsFree chan []foldAccount, y *blockYield) error {
 	var (
 		slotHeld   = &heldStream{stream: slots}
 		walked     atomic.Uint64 // accounts and slots
 		walkedAccs uint64
 		acctRows   *spillFile
-		storageSum *digestAhead
 		worker     int
 		cur        *foldBatch
 		pending    []foldAccount
@@ -206,8 +203,6 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 			return err
 		}
 		defer acctRows.close()
-		storageSum = written.storage.ahead()
-		defer storageSum.finish()
 	}
 	take := func() error {
 		if err := y.pause(ctx); err != nil {
@@ -289,7 +284,6 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 				cur.vals = append(cur.vals, svalue...)
 				cur.ends = append(cur.ends, len(cur.vals))
 				if flat != nil {
-					storageSum.add(skey, svalue)
 					rowKey = append(append(rowKey[:0], rawdb.SnapshotStoragePrefix...), skey...)
 					if err := flat.storage.put(rowKey, svalue); err != nil {
 						return err
@@ -357,22 +351,13 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 	if flat == nil {
 		return nil
 	}
-	if err := storageSum.finish(); err != nil {
-		return err
-	}
 	if err := flat.storage.commit(); err != nil {
 		return err
-	}
-	if written.storageWritten != nil {
-		written.storageWritten()
 	}
 	var rows atomic.Uint64
 	prog = startProgress("Writing flat accounts", "accounts", walkedAccs, rows.Load)
 	defer prog.stop()
-	accountSum := written.accounts.ahead()
-	defer accountSum.finish()
 	err := acctRows.replay(bufio.NewReaderSize(nil, 256<<10), func(hash, row []byte) error {
-		accountSum.add(hash, row)
 		rowKey = append(append(rowKey[:0], rawdb.SnapshotAccountPrefix...), hash...)
 		if err := flat.accounts.put(rowKey, row); err != nil {
 			return err
@@ -383,9 +368,6 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 		return nil
 	})
 	if err != nil {
-		return err
-	}
-	if err := accountSum.finish(); err != nil {
 		return err
 	}
 	if err := flat.accounts.commit(); err != nil {
@@ -479,62 +461,6 @@ func foldAccounts(ctx context.Context, in <-chan []foldAccount, free chan<- []fo
 	return tr.Hash(), nil
 }
 
-// Both commands prove what they wrote into the binary tree namespace: each
-// writer digests its records in key order, and a re-read of each key family
-// must reproduce the digest.
-
-// writeDigest hashes one key family's records in the order written. Keys are
-// the family-relative suffixes the namespace stores them under. Records are
-// hashed in batches of recordBatchSize, on pool's goroutines (see ahead),
-// and the family's digest hashes the batch digests in order.
-type writeDigest struct {
-	top   crypto.KeccakState
-	count uint64
-	pool  *digestPool
-}
-
-func newWriteDigest(pool *digestPool) *writeDigest {
-	return &writeDigest{top: crypto.NewKeccakState(), pool: pool}
-}
-
-func (d *writeDigest) sum() common.Hash {
-	return common.BytesToHash(d.top.Sum(nil))
-}
-
-// digestPool hashes the batches of every digestAhead of a command, on as
-// many goroutines as the command has workers: the families written and read
-// back at once share them.
-type digestPool struct {
-	work chan *digestBatch
-}
-
-func newDigestPool(workers int) *digestPool {
-	workers = max(workers, 1)
-	p := &digestPool{work: make(chan *digestBatch, 2*workers)}
-	for range workers {
-		go func() {
-			hasher := crypto.NewKeccakState()
-			for b := range p.work {
-				b.sum, b.err = b.digest(hasher)
-				b.hashed <- struct{}{}
-			}
-		}()
-	}
-	return p
-}
-
-// close stops the pool, once every digestAhead on it has finished.
-func (p *digestPool) close() { close(p.work) }
-
-// digestAhead digests records on its pool's goroutines, so that a writer on
-// the critical path only copies them.
-type digestAhead struct {
-	work, order, free chan *digestBatch
-	cur               *digestBatch
-	done              chan error
-	err               error
-}
-
 // recordBatch packs records back to back: ends holds each record's key end,
 // then its value end.
 type recordBatch struct {
@@ -575,151 +501,18 @@ const (
 	recordBatchBytes = 256 << 10
 )
 
-// digestBatch is a batch of records on its way through a digestAhead.
-type digestBatch struct {
-	recordBatch
-	sum    common.Hash
-	err    error
-	hashed chan struct{}
-}
-
-// digestDepth is how many batches one family has hashing or queued at once.
-const digestDepth = 8
-
-// digest hashes the batch's records, whose keys must ascend.
-func (b *digestBatch) digest(hasher crypto.KeccakState) (common.Hash, error) {
-	hasher.Reset()
-	var lengths [8]byte
-	for i := range b.len() {
-		key, value := b.key(i), b.value(i)
-		if i > 0 && bytes.Compare(key, b.key(i-1)) <= 0 {
-			return common.Hash{}, fmt.Errorf("record %x written after %x, out of key order", key, b.key(i-1))
-		}
-		binary.BigEndian.PutUint32(lengths[:4], uint32(len(key)))
-		binary.BigEndian.PutUint32(lengths[4:], uint32(len(value)))
-		hasher.Write(lengths[:])
-		hasher.Write(key)
-		hasher.Write(value)
-	}
-	var sum common.Hash
-	hasher.Read(sum[:])
-	return sum, nil
-}
-
-// ahead starts digesting the records handed to the returned digestAhead, in
-// order, on d's pool. Its finish reports keys that do not ascend.
-func (d *writeDigest) ahead() *digestAhead {
-	a := &digestAhead{
-		work:  d.pool.work,
-		order: make(chan *digestBatch, digestDepth),
-		free:  make(chan *digestBatch, digestDepth+1),
-		done:  make(chan error, 1),
-	}
-	for range cap(a.free) {
-		a.free <- &digestBatch{hashed: make(chan struct{}, 1)}
-	}
-	a.cur = <-a.free
-	order := a.order // finish clears a.order
-	go func() {
-		var (
-			err  error
-			last []byte // key of the last record folded
-		)
-		for b := range order {
-			<-b.hashed
-			if err == nil {
-				err = b.err
-			}
-			if err == nil && d.count > 0 && bytes.Compare(b.key(0), last) <= 0 {
-				err = fmt.Errorf("record %x written after %x, out of key order", b.key(0), last)
-			}
-			if err == nil {
-				d.top.Write(b.sum[:])
-				d.count += uint64(b.len())
-				last = append(last[:0], b.key(b.len()-1)...)
-			}
-			b.reset()
-			a.free <- b
-		}
-		a.done <- err
-	}()
-	return a
-}
-
-// add copies one record for the digest.
-func (a *digestAhead) add(key, value []byte) {
-	a.cur.add(key, value)
-	if a.cur.full() {
-		a.order <- a.cur
-		a.work <- a.cur
-		a.cur = <-a.free
-	}
-}
-
-// finish waits for every record to be digested and returns the first error
-// the digest met. Later calls return the same.
-func (a *digestAhead) finish() error {
-	if a.order == nil {
-		return a.err
-	}
-	if a.cur.len() > 0 {
-		a.order <- a.cur
-		a.work <- a.cur
-	}
-	close(a.order)
-	a.err, a.order = <-a.done, nil
-	return a.err
-}
-
-// writtenState digests the three key families a command writes, on a pool it
-// stops on close. storageWritten, if set, runs once every flat storage row
-// is in the database and digested, before the flat accounts are written.
-type writtenState struct {
-	nodes, accounts, storage *writeDigest
-	storageWritten           func()
-	pool                     *digestPool
-}
-
-func newWrittenState(workers int) *writtenState {
-	pool := newDigestPool(workers)
-	return &writtenState{nodes: newWriteDigest(pool), accounts: newWriteDigest(pool), storage: newWriteDigest(pool), pool: pool}
-}
-
-func (w *writtenState) close() { w.pool.close() }
-
-// writtenFamily is one key family a command writes, with the digest of what
-// it wrote.
-type writtenFamily struct {
-	name   string
-	prefix []byte
-	want   *writeDigest
-}
-
-// families lists the key families written: tree nodes, flat accounts, flat
-// storage.
-func (w *writtenState) families() []writtenFamily {
-	return []writtenFamily{
-		{"tree node", rawdb.TrieNodeAccountPrefix, w.nodes},
-		{"flat account", rawdb.SnapshotAccountPrefix, w.accounts},
-		{"flat storage", rawdb.SnapshotStoragePrefix, w.storage},
-	}
-}
-
 // writeStagedNodes writes the staged tree nodes into the namespace in key
-// order through w, digesting each, and commits them.
-func writeStagedNodes(ctx context.Context, w familyWriter, nodes *nodeStager, digest *writeDigest, y *blockYield) error {
+// order through w, and commits them.
+func writeStagedNodes(ctx context.Context, w familyWriter, nodes *nodeStager, y *blockYield) error {
 	var (
-		ahead   = digest.ahead()
 		staged  uint64
 		flushed atomic.Uint64
 		prog    = startProgress("Writing tree nodes", "nodes", nodes.count, flushed.Load)
 		key     []byte // the node's, reused: the writer copies it
 		size    int    // bytes put since the last pause
 	)
-	defer ahead.finish()
 	defer prog.stop()
 	err := nodes.replay(func(path, blob []byte) error {
-		ahead.add(path, blob)
 		key = append(append(key[:0], rawdb.TrieNodeAccountPrefix...), path...)
 		if err := w.put(key, blob); err != nil {
 			return err
@@ -735,57 +528,9 @@ func writeStagedNodes(ctx context.Context, w familyWriter, nodes *nodeStager, di
 	if err != nil {
 		return err
 	}
-	if err := ahead.finish(); err != nil {
-		return err
-	}
 	if err := w.commit(); err != nil {
 		return err
 	}
 	prog.finish("Wrote tree nodes", "nodes", staged)
 	return nil
-}
-
-// verifyWritten re-reads each family in key order, concurrently, and
-// requires it to match what was written. The namespace was empty when the
-// command began, so a family holding anything more is a mismatch as well.
-func verifyWritten(ctx context.Context, pbtdb ethdb.Database, y *blockYield, families ...writtenFamily) error {
-	var g errgroup.Group
-	for _, f := range families {
-		g.Go(func() error {
-			var read atomic.Uint64
-			prog := startProgress("Reading back "+f.name+" records", "records", f.want.count, read.Load)
-			defer prog.stop()
-			got := newWriteDigest(f.want.pool)
-			ahead := got.ahead()
-			defer ahead.finish()
-			it := pbtdb.NewIterator(f.prefix, nil)
-			defer it.Release()
-			for n := uint64(1); it.Next(); n++ {
-				ahead.add(it.Key()[len(f.prefix):], it.Value())
-				if n%4096 == 0 {
-					read.Store(n)
-					if err := y.pause(ctx); err != nil {
-						return err
-					}
-				}
-			}
-			if err := it.Error(); err != nil {
-				return err
-			}
-			if err := ahead.finish(); err != nil {
-				return err
-			}
-			if got.count != f.want.count || got.sum() != f.want.sum() {
-				return fmt.Errorf("%s records read back differ from those written: %d read, %d written", f.name, got.count, f.want.count)
-			}
-			return nil
-		})
-	}
-	return g.Wait()
-}
-
-// logWritten reports a verified write-back.
-func logWritten(written *writtenState) {
-	log.Info("Verified the written state", "nodes", written.nodes.count,
-		"accounts", written.accounts.count, "slots", written.storage.count)
 }

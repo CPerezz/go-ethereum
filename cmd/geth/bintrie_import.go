@@ -1025,31 +1025,14 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	} else {
 		prog.finish("Built the binary tree", "root", root, "leaves", stats.leaves.Load())
 	}
-	// One knob for the parallelism: the digests share opts.workers hashing
-	// goroutines, and as many families are read back at once.
-	var (
-		written  = newWrittenState(opts.workers)
-		families = written.families()
-		readBack errgroup.Group
-	)
-	defer written.close() // after the read-back below
-	readBack.SetLimit(max(opts.workers, 1))
-	defer readBack.Wait()
 	if nodes != nil {
 		nodeWriter, err := newFamilyWriter(chaindb, pbtdb, opts.tmpDir)
 		if err != nil {
 			return common.Hash{}, err
 		}
 		defer nodeWriter.abort()
-		if err := writeStagedNodes(ctx, nodeWriter, nodes, written.nodes, opts.yield); err != nil {
+		if err := writeStagedNodes(ctx, nodeWriter, nodes, opts.yield); err != nil {
 			return common.Hash{}, err
-		}
-		// The tree nodes are all written: read them back while the code
-		// limb and check 2 run. Reading puts nothing in the memtable.
-		readBack.Go(func() error { return verifyWritten(ctx, pbtdb, opts.yield, families[0]) })
-		// Likewise the flat storage, once check 2 has written its last row.
-		written.storageWritten = func() {
-			readBack.Go(func() error { return verifyWritten(ctx, pbtdb, opts.yield, families[2]) })
 		}
 	}
 
@@ -1127,7 +1110,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		}
 		defer flat.abort()
 	}
-	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, flat, written, opts.tmpDir, opts.workers, stats.accounts.Load()+stats.slots.Load(), opts.yield)
+	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, flat, opts.tmpDir, opts.workers, stats.accounts.Load()+stats.slots.Load(), opts.yield)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -1146,11 +1129,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	if err := flush(true); err != nil {
 		return common.Hash{}, err
 	}
-	readBack.Go(func() error { return verifyWritten(ctx, pbtdb, opts.yield, families[1]) })
-	if err := readBack.Wait(); err != nil {
-		return common.Hash{}, err
-	}
-	logWritten(written)
+	log.Info("Wrote the binary tree state", "nodes", nodes.count, "accounts", stats.accounts.Load(), "slots", stats.slots.Load())
 	// A cancelled import never attests, however far it got: an interrupted
 	// run is redone from scratch, never half-trusted.
 	if err := ctx.Err(); err != nil {
