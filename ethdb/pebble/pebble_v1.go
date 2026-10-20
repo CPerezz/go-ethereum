@@ -22,6 +22,7 @@ package pebble
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -30,6 +31,9 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
@@ -93,6 +97,7 @@ type V1Database struct {
 	writeDelayTime      atomic.Int64 // Total time spent in write stalls
 
 	writeOptions *pebble.WriteOptions
+	tableOpts    sstable.WriterOptions // the bottom level's, for NewTableWriter
 }
 
 func (d *V1Database) onCompactionBegin(info pebble.CompactionInfo) {
@@ -303,6 +308,7 @@ func NewV1(file string, cache int, handles int, namespace string, readonly bool)
 	stops := opt.Clone().EnsureDefaults()
 	db.memTableStop = uint64(stops.MemTableStopWritesThreshold) * stops.MemTableSize
 	db.l0Stop = stops.L0StopWritesThreshold
+	db.tableOpts = stops.MakeWriterOptions(len(stops.Levels)-1, innerDB.FormatMajorVersion().MaxTableFormat())
 
 	db.compTimeMeter = metrics.GetOrRegisterMeter(namespace+"compact/time", nil)
 	db.compReadMeter = metrics.GetOrRegisterMeter(namespace+"compact/input", nil)
@@ -500,6 +506,42 @@ func (d *V1Database) Compact(start []byte, limit []byte) error {
 // Path returns the path to the database directory.
 func (d *V1Database) Path() string {
 	return d.fn
+}
+
+// NewTableWriter creates a sorted table file at path for a later Ingest, in
+// the database's table format with the bottom level's options: tables of a
+// key range the database holds nothing in land there.
+func (d *V1Database) NewTableWriter(path string) (ethdb.TableWriter, error) {
+	f, err := vfs.Default.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return v1TableWriter{sstable.NewWriter(objstorageprovider.NewFileWritable(f), d.tableOpts)}, nil
+}
+
+// v1TableWriter is a pebble v1 sstable.Writer as an ethdb.TableWriter.
+type v1TableWriter struct{ *sstable.Writer }
+
+// Put appends a record; the writer copies key and value.
+func (w v1TableWriter) Put(key, value []byte) error { return w.Set(key, value) }
+
+// Ingest atomically adds the closed tables at paths to the database,
+// bypassing the write-ahead log and memtables. On success pebble links (or,
+// across filesystems, copies) the files in and removes them; on failure it
+// leaves them, so this removes them itself.
+func (d *V1Database) Ingest(paths []string) error {
+	d.quitLock.RLock()
+	defer d.quitLock.RUnlock()
+	err := pebble.ErrClosed
+	if !d.closed {
+		err = d.db.Ingest(paths)
+	}
+	if err != nil {
+		for _, p := range paths {
+			os.Remove(p)
+		}
+	}
+	return err
 }
 
 // SyncKeyValue flushes all pending writes in the write-ahead-log to disk,

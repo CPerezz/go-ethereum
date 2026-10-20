@@ -111,6 +111,31 @@ type CompactionController interface {
 	LimitCompactions(n int)
 }
 
+// TableWriter builds one sorted table file for TableIngester.Ingest.
+type TableWriter interface {
+	// Put appends a record. Keys must strictly ascend.
+	Put(key []byte, value []byte) error
+
+	// Close finishes the table file. It must be called even after a failed Put,
+	// to release the file.
+	Close() error
+}
+
+// TableIngester is implemented by data stores that can adopt sorted tables
+// built outside them, bypassing their write-ahead log, memtables and the
+// compactions after: for bulk writers of key ranges the store holds nothing
+// in.
+type TableIngester interface {
+	// NewTableWriter creates a table file at path, in the store's own format.
+	NewTableWriter(path string) (TableWriter, error)
+
+	// Ingest atomically adds the closed tables at paths to the store. The key
+	// ranges of the tables must not overlap each other; touching bounds count
+	// as overlap. The files are consumed whether or not it succeeds. Tables on
+	// the store's filesystem are linked in rather than copied.
+	Ingest(paths []string) error
+}
+
 // KeyValueStore contains all the methods required to allow handling different
 // key-value data stores backing the high level database.
 type KeyValueStore interface {

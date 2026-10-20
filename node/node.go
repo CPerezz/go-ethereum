@@ -805,6 +805,10 @@ func (db *closeTrackingDB) LimitCompactions(n int) {
 	}
 }
 
+// Unwrap returns the database the wrapper tracks, for callers reaching for
+// optional interfaces of the engine (rawdb.KeyValueStoreOf).
+func (db *closeTrackingDB) Unwrap() ethdb.Database { return db.Database }
+
 // wrapDatabase ensures the database will be auto-closed when Node is closed.
 func (n *Node) wrapDatabase(db ethdb.Database) ethdb.Database {
 	wrapper := &closeTrackingDB{db, n}
