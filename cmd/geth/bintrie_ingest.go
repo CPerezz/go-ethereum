@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -43,15 +44,21 @@ type familyWriter interface {
 // would span them and the family's keys alike, and the database would rewrite
 // the family on each level down.
 func newFamilyWriter(chaindb, pbtdb ethdb.Database, tmpDir string) (familyWriter, error) {
-	ing, ok := rawdb.KeyValueStoreOf(chaindb).(ethdb.TableIngester)
-	if !ok {
+	ing := ingesterOf(chaindb)
+	if ing == nil {
 		return &batchFamily{batch: pbtdb.NewBatch()}, nil
 	}
 	dir, err := os.MkdirTemp(tmpDir, "bintrie-tables-")
 	if err != nil {
 		return nil, err
 	}
-	return &tableFamily{db: ing, dir: dir}, nil
+	return newTableFamily(ing, dir), nil
+}
+
+// ingesterOf returns the table ingester behind db, nil if its store has none.
+func ingesterOf(db ethdb.Database) ethdb.TableIngester {
+	ing, _ := rawdb.KeyValueStoreOf(db).(ethdb.TableIngester)
+	return ing
 }
 
 // batchFamily writes a family through a batch, written out as it fills.
@@ -85,59 +92,122 @@ const familyTableBytes = 128 << 20
 
 // tableFamily writes a family into sorted tables under dir, one after the
 // other, which commit ingests in one call: a family's tables follow each
-// other in key order, so none overlap.
+// other in key order, so none overlap. put only copies records into batches;
+// a goroutine of the family's own builds the tables, off the writer's
+// critical path.
 type tableFamily struct {
-	db    ethdb.TableIngester
-	dir   string // on the database's filesystem, the tables are linked in
-	w     ethdb.TableWriter
-	size  int
-	paths []string
-	key   []byte
+	db  ethdb.TableIngester
+	dir string // on the database's filesystem, the tables are linked in
+
+	cur        *recordBatch
+	work, free chan *recordBatch
+	done       chan struct{}
+	err        atomic.Pointer[error] // the first error build met
+	paths      []string              // owned by build until done is closed
+}
+
+func newTableFamily(db ethdb.TableIngester, dir string) *tableFamily {
+	t := &tableFamily{
+		db:   db,
+		dir:  dir,
+		work: make(chan *recordBatch, 4),
+		free: make(chan *recordBatch, 5),
+		done: make(chan struct{}),
+	}
+	for range cap(t.free) {
+		t.free <- new(recordBatch)
+	}
+	t.cur = <-t.free
+	go t.build()
+	return t
+}
+
+// build writes each batch's records into the family's tables until work
+// closes, cutting a table at familyTableBytes. After an error it only
+// recycles the batches.
+func (t *tableFamily) build() {
+	defer close(t.done)
+	var (
+		w    ethdb.TableWriter
+		size int
+		key  []byte // the record's, under the namespace's prefix
+		err  error
+	)
+	for b := range t.work {
+		for i := 0; err == nil && i < b.len(); i++ {
+			if w == nil {
+				path := filepath.Join(t.dir, fmt.Sprintf("%06d.sst", len(t.paths)))
+				if w, err = t.db.NewTableWriter(path); err != nil {
+					w = nil
+					break
+				}
+				t.paths, size = append(t.paths, path), 0
+			}
+			key = append(append(key[:0], rawdb.PBTPrefix...), b.key(i)...)
+			value := b.value(i)
+			if err = w.Put(key, value); err != nil {
+				break
+			}
+			if size += len(key) + len(value); size >= familyTableBytes {
+				err, w = w.Close(), nil
+			}
+		}
+		if err != nil {
+			t.err.CompareAndSwap(nil, &err)
+		}
+		b.reset()
+		t.free <- b
+	}
+	if w != nil {
+		if cerr := w.Close(); cerr != nil {
+			t.err.CompareAndSwap(nil, &cerr)
+		}
+	}
 }
 
 func (t *tableFamily) put(key, value []byte) error {
-	if t.w == nil {
-		path := filepath.Join(t.dir, fmt.Sprintf("%06d.sst", len(t.paths)))
-		w, err := t.db.NewTableWriter(path)
-		if err != nil {
-			return err
-		}
-		t.w, t.size, t.paths = w, 0, append(t.paths, path)
-	}
-	t.key = append(append(t.key[:0], rawdb.PBTPrefix...), key...)
-	if err := t.w.Put(t.key, value); err != nil {
-		return err
-	}
-	if t.size += len(t.key) + len(value); t.size < familyTableBytes {
+	t.cur.add(key, value)
+	if !t.cur.full() {
 		return nil
 	}
-	w := t.w
-	t.w = nil
-	return w.Close()
+	t.work <- t.cur
+	t.cur = <-t.free
+	if err := t.err.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
+// finish hands over the last batch and waits until every record put is in a
+// table.
+func (t *tableFamily) finish() {
+	if t.work == nil {
+		return
+	}
+	if t.cur.len() > 0 {
+		t.work <- t.cur
+	}
+	close(t.work)
+	<-t.done
+	t.work, t.cur, t.free = nil, nil, nil
 }
 
 func (t *tableFamily) commit() error {
 	defer os.RemoveAll(t.dir)
-	if t.w != nil {
-		w := t.w
-		t.w = nil
-		if err := w.Close(); err != nil {
-			return err
-		}
-	}
-	if len(t.paths) == 0 {
-		return nil
+	t.finish()
+	if err := t.err.Load(); err != nil {
+		return *err
 	}
 	paths := t.paths
 	t.paths = nil
+	if len(paths) == 0 {
+		return nil
+	}
 	return t.db.Ingest(paths)
 }
 
 func (t *tableFamily) abort() {
-	if t.w != nil {
-		t.w.Close()
-		t.w = nil
-	}
+	t.finish()
 	t.paths = nil
 	os.RemoveAll(t.dir)
 }
