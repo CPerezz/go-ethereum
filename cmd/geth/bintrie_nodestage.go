@@ -26,6 +26,8 @@ import (
 	"slices"
 	"sync/atomic"
 
+	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/internal/pagecache"
 	"github.com/golang/snappy"
 )
@@ -36,14 +38,19 @@ import (
 // each depth in ascending order, but children before parents, so consecutive
 // nodes jump between depths. Written as they come, every flushed table spans
 // the node keys of every depth and overlaps the tables before it, so the
-// database rewrites the nodes at each level on the way down. One append-only
-// file per depth, replayed in depth order, writes them in ascending key order
-// instead. add only copies nodes into batches; a goroutine of the stager's
-// own appends them to their files, off the tree builder's critical path.
+// database rewrites the nodes at each level on the way down. Each depth gets
+// its own sorted tables instead, which commit ingests, if the database can;
+// otherwise one append-only file per depth, replayed in depth order, writes
+// them in ascending key order. add only copies nodes into batches; a goroutine
+// of the stager's own hands them to their depths, off the tree builder's
+// critical path, and with tables each depth builds its own on a goroutine.
 type nodeStager struct {
 	dir    string
-	depths map[int]*spillFile // owned by stage until wait returns
-	count  uint64             // nodes added
+	ing    ethdb.TableIngester  // nil: spill files and a replay
+	depths map[int]*spillFile   // owned by stage until wait returns
+	tables map[int]*tableFamily // likewise, with ing
+	key    []byte               // stage's, a node's key in the namespace
+	count  uint64               // nodes added
 
 	cur        *recordBatch
 	work, free chan *recordBatch
@@ -51,15 +58,18 @@ type nodeStager struct {
 	err        atomic.Pointer[error] // the first error stage met
 }
 
-// newNodeStager stages its files in a fresh directory under tmpDir.
-func newNodeStager(tmpDir string) (*nodeStager, error) {
+// newNodeStager stages in a fresh directory under tmpDir: tables ing ingests,
+// if set, or spill files.
+func newNodeStager(tmpDir string, ing ethdb.TableIngester) (*nodeStager, error) {
 	dir, err := os.MkdirTemp(tmpDir, "bintrie-nodes-")
 	if err != nil {
 		return nil, err
 	}
 	s := &nodeStager{
 		dir:    dir,
+		ing:    ing,
 		depths: make(map[int]*spillFile),
+		tables: make(map[int]*tableFamily),
 		work:   make(chan *recordBatch, 4),
 		free:   make(chan *recordBatch, 5),
 		done:   make(chan struct{}),
@@ -97,9 +107,22 @@ func (s *nodeStager) stage(work <-chan *recordBatch) {
 	}
 }
 
-// write appends one node to its depth's file.
+// write hands one node to its depth: its tables, or its file.
 func (s *nodeStager) write(path, blob []byte) error {
 	depth := nodeDepth(path)
+	if s.ing != nil {
+		t := s.tables[depth]
+		if t == nil {
+			dir, err := os.MkdirTemp(s.dir, fmt.Sprintf("depth-%d-", depth))
+			if err != nil {
+				return err
+			}
+			t = newTableFamily(s.ing, dir)
+			s.tables[depth] = t
+		}
+		s.key = append(append(s.key[:0], rawdb.TrieNodeAccountPrefix...), path...)
+		return t.put(s.key, blob)
+	}
 	d := s.depths[depth]
 	if d == nil {
 		var err error
@@ -147,7 +170,7 @@ func (s *nodeStager) wait() error {
 // replay feeds every staged node to write in database key order: depth by
 // depth, each depth in the order its nodes were added. path and blob are only
 // valid for the call. Each depth's file is removed once replayed, so replay
-// runs once.
+// runs once. A stager with tables has nothing to replay: see commit.
 func (s *nodeStager) replay(write func(path, blob []byte) error) error {
 	if err := s.wait(); err != nil {
 		return err
@@ -163,11 +186,29 @@ func (s *nodeStager) replay(write func(path, blob []byte) error) error {
 	return nil
 }
 
-// close removes the staging files.
+// commit ingests every depth's tables, in depth order: the database reads the
+// nodes from here on.
+func (s *nodeStager) commit() error {
+	if err := s.wait(); err != nil {
+		return err
+	}
+	for _, depth := range slices.Sorted(maps.Keys(s.tables)) {
+		if err := s.tables[depth].commit(); err != nil {
+			return err
+		}
+		delete(s.tables, depth)
+	}
+	return nil
+}
+
+// close removes what is staged and not committed.
 func (s *nodeStager) close() {
 	s.wait()
 	for _, d := range s.depths {
 		d.close()
+	}
+	for _, t := range s.tables {
+		t.abort()
 	}
 	os.RemoveAll(s.dir)
 }

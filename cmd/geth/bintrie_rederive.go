@@ -24,11 +24,13 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
@@ -501,10 +503,20 @@ const (
 	recordBatchBytes = 256 << 10
 )
 
-// writeStagedNodes writes the staged tree nodes into the namespace in key
-// order through w, and commits them.
-func writeStagedNodes(ctx context.Context, w familyWriter, nodes *nodeStager, y *blockYield) error {
+// writeStagedNodes writes the staged tree nodes into the namespace: a stager
+// with tables commits them, one with spill files replays them in key order
+// into batches.
+func writeStagedNodes(ctx context.Context, pbtdb ethdb.Database, nodes *nodeStager, y *blockYield) error {
+	if nodes.ing != nil {
+		start := time.Now()
+		if err := nodes.commit(); err != nil {
+			return err
+		}
+		log.Info("Wrote tree nodes", "nodes", nodes.count, "elapsed", common.PrettyDuration(time.Since(start)))
+		return nil
+	}
 	var (
+		w       = &batchFamily{batch: pbtdb.NewBatch()}
 		staged  uint64
 		flushed atomic.Uint64
 		prog    = startProgress("Writing tree nodes", "nodes", nodes.count, flushed.Load)

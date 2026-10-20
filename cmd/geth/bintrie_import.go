@@ -653,7 +653,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		nodes      *nodeStager
 	)
 	if !verifyOnly {
-		if nodes, err = newNodeStager(opts.tmpDir); err != nil {
+		if nodes, err = newNodeStager(opts.tmpDir, ingesterOf(chaindb)); err != nil {
 			return common.Hash{}, err
 		}
 		defer nodes.close()
@@ -1026,12 +1026,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		prog.finish("Built the binary tree", "root", root, "leaves", stats.leaves.Load())
 	}
 	if nodes != nil {
-		nodeWriter, err := newFamilyWriter(chaindb, pbtdb, opts.tmpDir)
-		if err != nil {
-			return common.Hash{}, err
-		}
-		defer nodeWriter.abort()
-		if err := writeStagedNodes(ctx, nodeWriter, nodes, opts.yield); err != nil {
+		if err := writeStagedNodes(ctx, pbtdb, nodes, opts.yield); err != nil {
 			return common.Hash{}, err
 		}
 	}
