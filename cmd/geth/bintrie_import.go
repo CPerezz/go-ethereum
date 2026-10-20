@@ -600,28 +600,18 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		defer snap.close()
 		leaves = snap
 	}
-	var (
-		pbtBatch ethdb.Batch // tree nodes and flat state, inside the namespace
-		rawBatch ethdb.Batch // code and preimages, outside it
-	)
-	if !verifyOnly {
-		pbtBatch = pbtdb.NewBatch()
-		if own == nil {
-			rawBatch = chaindb.NewBatch()
-		}
+	var rawBatch ethdb.Batch // code and preimages, outside the namespace
+	if !verifyOnly && own == nil {
+		rawBatch = chaindb.NewBatch()
 	}
 	flush := func(force bool) error {
-		for _, batch := range []ethdb.Batch{pbtBatch, rawBatch} {
-			if batch == nil {
-				continue
-			}
-			if force || batch.ValueSize() >= ethdb.IdealBatchSize {
-				if err := batch.Write(); err != nil {
-					return err
-				}
-				batch.Reset()
-			}
+		if rawBatch == nil || (!force && rawBatch.ValueSize() < ethdb.IdealBatchSize) {
+			return nil
 		}
+		if err := rawBatch.Write(); err != nil {
+			return err
+		}
+		rawBatch.Reset()
 		return nil
 	}
 
@@ -1046,7 +1036,12 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	readBack.SetLimit(max(opts.workers, 1))
 	defer readBack.Wait()
 	if nodes != nil {
-		if err := writeStagedNodes(ctx, pbtdb, nodes, written.nodes, opts.yield); err != nil {
+		nodeWriter, err := newFamilyWriter(chaindb, pbtdb, opts.tmpDir)
+		if err != nil {
+			return common.Hash{}, err
+		}
+		defer nodeWriter.abort()
+		if err := writeStagedNodes(ctx, nodeWriter, nodes, written.nodes, opts.yield); err != nil {
 			return common.Hash{}, err
 		}
 		// The tree nodes are all written: read them back while the code
@@ -1125,7 +1120,14 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	if err != nil {
 		return common.Hash{}, err
 	}
-	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, pbtBatch, written, opts.tmpDir, opts.workers, stats.accounts.Load()+stats.slots.Load(), opts.yield)
+	var flat *flatWriters // the flat state check 2 writes; none when only verifying
+	if !verifyOnly {
+		if flat, err = newFlatWriters(chaindb, pbtdb, opts.tmpDir); err != nil {
+			return common.Hash{}, err
+		}
+		defer flat.abort()
+	}
+	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, flat, written, opts.tmpDir, opts.workers, stats.accounts.Load()+stats.slots.Load(), opts.yield)
 	if err != nil {
 		return common.Hash{}, err
 	}
