@@ -205,20 +205,120 @@ func (s *RecordSorter) spill() error {
 	return nil
 }
 
-// runWriter writes a run through snappy: hashes don't compress, but the
+// A run is written as snappy blocks of at most runBlockSize bytes, each behind
+// its encoded length (4 bytes, big endian): hashes don't compress, but the
 // values, the lengths and the prefixes neighbouring keys share do, which
-// about halves a run on disk.
+// about halves a run on disk. A merge holds one block and its encoding per
+// run, ~35 KiB, and merges can hold thousands of runs at once: snappy's own
+// framing would hold 140 KiB per run.
+const runBlockSize = 16 << 10
+
+// runWriter writes a run: records into bw, whose bytes the blockWriter
+// cuts into blocks.
 type runWriter struct {
 	bw *bufio.Writer
-	sw *snappy.Writer
+	cw *blockWriter
 }
 
-// runWriters holds the spill writers: a run's 1 MiB buffer and its snappy
+// runWriters holds the spill writers: a run's 1 MiB buffer and its block
 // buffers would otherwise be garbage once per spill.
 var runWriters = sync.Pool{New: func() any {
-	sw := snappy.NewBufferedWriter(nil)
-	return &runWriter{bw: bufio.NewWriterSize(sw, 1<<20), sw: sw}
+	cw := &blockWriter{raw: make([]byte, 0, runBlockSize), enc: make([]byte, 4+snappy.MaxEncodedLen(runBlockSize))}
+	return &runWriter{bw: bufio.NewWriterSize(cw, 1<<20), cw: cw}
 }}
+
+// blockWriter compresses what is written to it into blocks of runBlockSize.
+type blockWriter struct {
+	w   io.Writer
+	raw []byte // the block being filled
+	enc []byte // the length header and the encoded block
+}
+
+func (b *blockWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		k := copy(b.raw[len(b.raw):cap(b.raw)], p)
+		b.raw, p = b.raw[:len(b.raw)+k], p[k:]
+		if len(b.raw) == cap(b.raw) {
+			if err := b.Flush(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return n, nil
+}
+
+// Flush writes the block being filled, if it holds anything.
+func (b *blockWriter) Flush() error {
+	if len(b.raw) == 0 {
+		return nil
+	}
+	enc := snappy.Encode(b.enc[4:], b.raw)
+	binary.BigEndian.PutUint32(b.enc[:4], uint32(len(enc)))
+	b.raw = b.raw[:0]
+	_, err := b.w.Write(b.enc[:4+len(enc)])
+	return err
+}
+
+// blockReader reads back what a blockWriter wrote.
+type blockReader struct {
+	r   io.Reader
+	raw []byte // the current block, read up to off
+	off int
+	enc []byte
+}
+
+func newBlockReader(r io.Reader) *blockReader {
+	return &blockReader{r: r, raw: make([]byte, 0, runBlockSize), enc: make([]byte, snappy.MaxEncodedLen(runBlockSize))}
+}
+
+// next reads the next block, io.EOF after the last.
+func (b *blockReader) next() error {
+	var hdr [4]byte
+	if _, err := io.ReadFull(b.r, hdr[:]); err != nil {
+		if err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("bintrie: truncated sort run block header: %w", err)
+		}
+		return err // io.EOF included
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n > uint32(len(b.enc)) {
+		return fmt.Errorf("bintrie: sort run block of %d bytes, at most %d", n, len(b.enc))
+	}
+	if _, err := io.ReadFull(b.r, b.enc[:n]); err != nil {
+		return fmt.Errorf("bintrie: truncated sort run block: %w", err)
+	}
+	if l, err := snappy.DecodedLen(b.enc[:n]); err != nil || l > cap(b.raw) {
+		return fmt.Errorf("bintrie: corrupt sort run block (%d bytes decoded, %v)", l, err)
+	}
+	raw, err := snappy.Decode(b.raw[:cap(b.raw)], b.enc[:n])
+	if err != nil {
+		return fmt.Errorf("bintrie: corrupt sort run block: %w", err)
+	}
+	b.raw, b.off = raw, 0
+	return nil
+}
+
+func (b *blockReader) Read(p []byte) (int, error) {
+	for b.off == len(b.raw) {
+		if err := b.next(); err != nil {
+			return 0, err
+		}
+	}
+	n := copy(p, b.raw[b.off:])
+	b.off += n
+	return n, nil
+}
+
+func (b *blockReader) ReadByte() (byte, error) {
+	for b.off == len(b.raw) {
+		if err := b.next(); err != nil {
+			return 0, err
+		}
+	}
+	b.off++
+	return b.raw[b.off-1], nil
+}
 
 // writeRun sorts a run and writes it to a temporary file, rewound for reading.
 func writeRun(tmpDir string, arena []byte, index []arenaRecord) (*os.File, error) {
@@ -237,10 +337,10 @@ func writeRun(tmpDir string, arena []byte, index []arenaRecord) (*os.File, error
 		return nil, err
 	}
 	w := runWriters.Get().(*runWriter)
-	w.sw.Reset(pagecache.NewWriter(f))
-	w.bw.Reset(w.sw)
+	w.cw.w = pagecache.NewWriter(f)
+	w.bw.Reset(w.cw)
 	defer func() {
-		w.sw.Reset(nil)
+		w.cw.w, w.cw.raw = nil, w.cw.raw[:0]
 		runWriters.Put(w)
 	}()
 	for _, rec := range index {
@@ -251,7 +351,7 @@ func writeRun(tmpDir string, arena []byte, index []arenaRecord) (*os.File, error
 	if err := w.bw.Flush(); err != nil {
 		return discard(err)
 	}
-	if err := w.sw.Flush(); err != nil {
+	if err := w.cw.Flush(); err != nil {
 		return discard(err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -318,10 +418,10 @@ func (s *RecordSorter) Sort() (*RecordStream, error) {
 	// A merge reads every run at once and finishes them all together, so a
 	// run would hold its disk space to the merge's end: each is read through
 	// a consuming reader instead, which frees what it has read. A run's
-	// reader holds snappy's buffers, about 140 KiB.
+	// reader holds one block and its encoding, about 35 KiB.
 	var h runHeap
 	for _, f := range s.runs {
-		src := &runReader{r: snappy.NewReader(pagecache.NewConsumingReader(f))}
+		src := &runReader{r: newBlockReader(pagecache.NewConsumingReader(f))}
 		if err := src.advance(); err != nil {
 			if err == io.EOF {
 				continue
@@ -481,7 +581,7 @@ func (ls *RecordStream) Next() (key, value []byte, err error) {
 
 // runReader streams one spilled run.
 type runReader struct {
-	r          *snappy.Reader
+	r          *blockReader
 	buf        []byte
 	key, value []byte
 }
