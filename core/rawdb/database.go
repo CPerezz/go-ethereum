@@ -109,6 +109,25 @@ type nofreezedb struct {
 	ethdb.KeyValueStore
 }
 
+// KeyValueStoreOf returns the key-value store behind a database Open built,
+// past any wrapper that only adds behavior around it (node's close tracking is
+// one), or nil for any other database. Callers use it to reach optional
+// interfaces of the engine, such as ethdb.TableIngester.
+func KeyValueStoreOf(db ethdb.Database) ethdb.KeyValueStore {
+	for {
+		switch d := db.(type) {
+		case *freezerdb:
+			return d.KeyValueStore
+		case *nofreezedb:
+			return d.KeyValueStore
+		case interface{ Unwrap() ethdb.Database }:
+			db = d.Unwrap()
+		default:
+			return nil
+		}
+	}
+}
+
 // WriteBacklog returns how close the key-value store is to stopping writes,
 // zero if it doesn't compact in the background.
 func (db *nofreezedb) WriteBacklog() float64 {

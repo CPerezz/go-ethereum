@@ -18,9 +18,11 @@
 package pebble
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -29,8 +31,10 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
+	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/internal/pagecache"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 )
@@ -110,6 +114,7 @@ type Database struct {
 	writeDelayTime      atomic.Int64 // Total time spent in write stalls
 
 	writeOptions *pebble.WriteOptions
+	tableOpts    sstable.WriterOptions // the bottom level's, for NewTableWriter
 }
 
 func (d *Database) onCompactionBegin(info pebble.CompactionInfo) {
@@ -355,6 +360,7 @@ func New(file string, cache int, handles int, namespace string, readonly bool) (
 	stops.EnsureDefaults()
 	db.memTableStop = uint64(stops.MemTableStopWritesThreshold) * stops.MemTableSize
 	db.l0Stop = stops.L0StopWritesThreshold
+	db.tableOpts = stops.MakeWriterOptions(len(stops.Levels)-1, innerDB.TableFormat())
 
 	db.compTimeMeter = metrics.GetOrRegisterMeter(namespace+"compact/time", nil)
 	db.compReadMeter = metrics.GetOrRegisterMeter(namespace+"compact/input", nil)
@@ -567,6 +573,76 @@ func (d *Database) Compact(start []byte, limit []byte) error {
 // Path returns the path to the database directory.
 func (d *Database) Path() string {
 	return d.fn
+}
+
+// NewTableWriter creates a sorted table file at path for a later Ingest, in
+// the database's table format with the bottom level's options: tables of a
+// key range the database holds nothing in land there.
+func (d *Database) NewTableWriter(path string) (ethdb.TableWriter, error) {
+	f, err := newTableFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return tableWriter{sstable.NewWriter(f, d.tableOpts)}, nil
+}
+
+// tableFile is a table's file, written behind (internal/pagecache): a bulk
+// load's tables, written beside a running node, neither pile up as dirty pages
+// nor crowd its pages out of the page cache. Finish syncs it for Ingest.
+type tableFile struct {
+	f *os.File
+	w *bufio.Writer
+}
+
+func newTableFile(path string) (*tableFile, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return &tableFile{f: f, w: bufio.NewWriterSize(pagecache.NewWriter(f), 256<<10)}, nil
+}
+
+func (t *tableFile) Write(p []byte) error {
+	_, err := t.w.Write(p)
+	return err
+}
+
+func (t *tableFile) Finish() error {
+	err := t.w.Flush()
+	if err == nil {
+		err = t.f.Sync()
+	}
+	if cerr := t.f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+func (t *tableFile) Abort() { t.f.Close() }
+
+// tableWriter is an sstable.Writer as an ethdb.TableWriter.
+type tableWriter struct{ *sstable.Writer }
+
+// Put appends a record; the writer copies key and value.
+func (w tableWriter) Put(key, value []byte) error { return w.Set(key, value) }
+
+// Ingest atomically adds the closed tables at paths to the database,
+// bypassing the write-ahead log and memtables. On success pebble links (or,
+// across filesystems, copies) the files in and removes them; on failure it
+// leaves them, so this removes them itself.
+func (d *Database) Ingest(paths []string) error {
+	d.quitLock.RLock()
+	defer d.quitLock.RUnlock()
+	err := pebble.ErrClosed
+	if !d.closed {
+		err = d.db.Ingest(context.Background(), paths)
+	}
+	if err != nil {
+		for _, p := range paths {
+			os.Remove(p)
+		}
+	}
+	return err
 }
 
 // SyncKeyValue flushes all pending writes in the write-ahead-log to disk,

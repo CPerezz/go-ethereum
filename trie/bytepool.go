@@ -16,53 +16,6 @@
 
 package trie
 
-// bytesPool is a pool for byte slices. It is safe for concurrent use.
-type bytesPool struct {
-	c chan []byte
-	w int
-}
-
-// newBytesPool creates a new bytesPool. The sliceCap sets the capacity of
-// newly allocated slices, and the nitems determines how many items the pool
-// will hold, at maximum.
-func newBytesPool(sliceCap, nitems int) *bytesPool {
-	return &bytesPool{
-		c: make(chan []byte, nitems),
-		w: sliceCap,
-	}
-}
-
-// get returns a slice. Safe for concurrent use.
-func (bp *bytesPool) get() []byte {
-	select {
-	case b := <-bp.c:
-		return b
-	default:
-		return make([]byte, 0, bp.w)
-	}
-}
-
-// getWithSize returns a slice with specified byte slice size.
-func (bp *bytesPool) getWithSize(s int) []byte {
-	b := bp.get()
-	if cap(b) < s {
-		return make([]byte, s)
-	}
-	return b[:s]
-}
-
-// put returns a slice to the pool. Safe for concurrent use. This method
-// will ignore slices that are too small or too large (>3x the cap)
-func (bp *bytesPool) put(b []byte) {
-	if c := cap(b); c < bp.w || c > 3*bp.w {
-		return
-	}
-	select {
-	case bp.c <- b:
-	default:
-	}
-}
-
 // unsafeBytesPool is a pool for byte slices. It is not safe for concurrent use.
 type unsafeBytesPool struct {
 	items [][]byte
@@ -87,6 +40,15 @@ func (bp *unsafeBytesPool) get() []byte {
 		return last
 	}
 	return make([]byte, 0, bp.w)
+}
+
+// getWithSize returns a slice of length s.
+func (bp *unsafeBytesPool) getWithSize(s int) []byte {
+	b := bp.get()
+	if cap(b) < s {
+		return make([]byte, s)
+	}
+	return b[:s]
 }
 
 // put returns a slice to the pool. This method will ignore slices that are

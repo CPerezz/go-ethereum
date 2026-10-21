@@ -600,28 +600,18 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		defer snap.close()
 		leaves = snap
 	}
-	var (
-		pbtBatch ethdb.Batch // tree nodes and flat state, inside the namespace
-		rawBatch ethdb.Batch // code and preimages, outside it
-	)
-	if !verifyOnly {
-		pbtBatch = pbtdb.NewBatch()
-		if own == nil {
-			rawBatch = chaindb.NewBatch()
-		}
+	var rawBatch ethdb.Batch // code and preimages, outside the namespace
+	if !verifyOnly && own == nil {
+		rawBatch = chaindb.NewBatch()
 	}
 	flush := func(force bool) error {
-		for _, batch := range []ethdb.Batch{pbtBatch, rawBatch} {
-			if batch == nil {
-				continue
-			}
-			if force || batch.ValueSize() >= ethdb.IdealBatchSize {
-				if err := batch.Write(); err != nil {
-					return err
-				}
-				batch.Reset()
-			}
+		if rawBatch == nil || (!force && rawBatch.ValueSize() < ethdb.IdealBatchSize) {
+			return nil
 		}
+		if err := rawBatch.Write(); err != nil {
+			return err
+		}
+		rawBatch.Reset()
 		return nil
 	}
 
@@ -663,7 +653,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		nodes      *nodeStager
 	)
 	if !verifyOnly {
-		if nodes, err = newNodeStager(opts.tmpDir); err != nil {
+		if nodes, err = newNodeStager(opts.tmpDir, ingesterOf(chaindb), opts.yield); err != nil {
 			return common.Hash{}, err
 		}
 		defer nodes.close()
@@ -1035,26 +1025,9 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	} else {
 		prog.finish("Built the binary tree", "root", root, "leaves", stats.leaves.Load())
 	}
-	// One knob for the parallelism: the digests share opts.workers hashing
-	// goroutines, and as many families are read back at once.
-	var (
-		written  = newWrittenState(opts.workers)
-		families = written.families()
-		readBack errgroup.Group
-	)
-	defer written.close() // after the read-back below
-	readBack.SetLimit(max(opts.workers, 1))
-	defer readBack.Wait()
 	if nodes != nil {
-		if err := writeStagedNodes(ctx, pbtdb, nodes, written.nodes, opts.yield); err != nil {
+		if err := writeStagedNodes(ctx, pbtdb, nodes, opts.yield); err != nil {
 			return common.Hash{}, err
-		}
-		// The tree nodes are all written: read them back while the code
-		// limb and check 2 run. Reading puts nothing in the memtable.
-		readBack.Go(func() error { return verifyWritten(ctx, pbtdb, opts.yield, families[0]) })
-		// Likewise the flat storage, once check 2 has written its last row.
-		written.storageWritten = func() {
-			readBack.Go(func() error { return verifyWritten(ctx, pbtdb, opts.yield, families[2]) })
 		}
 	}
 
@@ -1125,7 +1098,14 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	if err != nil {
 		return common.Hash{}, err
 	}
-	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, pbtBatch, written, opts.tmpDir, opts.workers, stats.accounts.Load()+stats.slots.Load(), opts.yield)
+	var flat *flatWriters // the flat state check 2 writes; none when only verifying
+	if !verifyOnly {
+		if flat, err = newFlatWriters(chaindb, pbtdb, opts.tmpDir, opts.yield); err != nil {
+			return common.Hash{}, err
+		}
+		defer flat.abort()
+	}
+	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, flat, opts.workers, stats.accounts.Load()+stats.slots.Load(), opts.yield)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -1144,11 +1124,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	if err := flush(true); err != nil {
 		return common.Hash{}, err
 	}
-	readBack.Go(func() error { return verifyWritten(ctx, pbtdb, opts.yield, families[1]) })
-	if err := readBack.Wait(); err != nil {
-		return common.Hash{}, err
-	}
-	logWritten(written)
+	log.Info("Wrote the binary tree state", "nodes", nodes.count, "accounts", stats.accounts.Load(), "slots", stats.slots.Load())
 	// A cancelled import never attests, however far it got: an interrupted
 	// run is redone from scratch, never half-trusted.
 	if err := ctx.Err(); err != nil {
