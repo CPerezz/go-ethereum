@@ -27,7 +27,6 @@ import (
 
 var (
 	stPool = sync.Pool{New: func() any { return new(stNode) }}
-	bPool  = newBytesPool(32, 100)
 	_      = types.ListHasher((*StackTrie)(nil))
 )
 
@@ -51,6 +50,7 @@ type StackTrie struct {
 	kBuf       []byte // buf space used for hex-key during insertions
 	pBuf       []byte // buf space used for path during insertions
 	vPool      *unsafeBytesPool
+	hPool      *unsafeBytesPool // hashed nodes' values: the trie's own, as tries hashing side by side would contend on a shared one
 }
 
 // NewStackTrie allocates and initializes an empty trie. The committed nodes
@@ -63,6 +63,7 @@ func NewStackTrie(onTrieNode OnTrieNode) *StackTrie {
 		kBuf:       make([]byte, 64),
 		pBuf:       make([]byte, 64),
 		vPool:      newUnsafeBytesPool(300, 20),
+		hPool:      newUnsafeBytesPool(32, 100),
 	}
 }
 
@@ -165,12 +166,12 @@ const (
 	hashedNode
 )
 
-func (n *stNode) reset() *stNode {
+func (n *stNode) reset(pool *unsafeBytesPool) *stNode {
 	if n.typ == hashedNode {
 		// On hashnodes, we 'own' the val: it is guaranteed to be not held
 		// by external caller. Hence, when we arrive here, we can put it
 		// back into the pool
-		bPool.put(n.val)
+		pool.put(n.val)
 	}
 	n.key = n.key[:0]
 	n.val = nil
@@ -372,7 +373,7 @@ func (t *StackTrie) hash(st *stNode, path []byte) {
 				continue
 			}
 			st.children[i] = nil
-			stPool.Put(child.reset()) // Release child back to pool.
+			stPool.Put(child.reset(t.hPool)) // Release child back to pool.
 		}
 
 	case extNode:
@@ -387,7 +388,7 @@ func (t *StackTrie) hash(st *stNode, path []byte) {
 		n.encode(t.h.encbuf)
 		blob = t.h.encodedBytes()
 
-		stPool.Put(st.children[0].reset()) // Release child back to pool.
+		stPool.Put(st.children[0].reset(t.hPool)) // Release child back to pool.
 		st.children[0] = nil
 
 	case leafNode:
@@ -416,13 +417,13 @@ func (t *StackTrie) hash(st *stNode, path []byte) {
 	// Skip committing the non-root node if the size is smaller than 32 bytes
 	// as tiny nodes are always embedded in their parent except root node.
 	if len(blob) < 32 && len(path) > 0 {
-		st.val = bPool.getWithSize(len(blob))
+		st.val = t.hPool.getWithSize(len(blob))
 		copy(st.val, blob)
 		return
 	}
 	// Write the hash to the 'val'. We allocate a new val here to not mutate
 	// input values.
-	st.val = bPool.getWithSize(32)
+	st.val = t.hPool.getWithSize(32)
 	t.h.hashDataTo(st.val, blob)
 
 	// Invoke the callback it's provided. Notably, the path and blob slices are
