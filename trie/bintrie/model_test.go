@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/rand"
+	"slices"
 	"sort"
 	"testing"
 
@@ -373,6 +374,92 @@ func TestStackBuilderEdges(t *testing.T) {
 	if err := NewStackBuilder(nil).Add([]byte{0x00, 0x01}, value); err == nil {
 		t.Fatal("expected rejection of a non-conformant key")
 	}
+}
+
+// TestParallelStackBuilder checks that the pipelined builder emits exactly
+// the inline builder's records, in its order, across many batches: the node
+// stagers replay them per depth in emission order.
+func TestParallelStackBuilder(t *testing.T) {
+	type record struct {
+		path, blob []byte
+		hash       common.Hash
+	}
+	build := func(b *StackBuilder, keys, values [][]byte) common.Hash {
+		for i, k := range keys {
+			if err := b.Add(k, values[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b.Finish()
+	}
+	rng := rand.New(rand.NewSource(8297))
+	for _, n := range []int{1, 2, 3, 1000, 5*buildBatchGroups + 17} {
+		set := make(map[string][]byte)
+		for len(set) < n {
+			stem := make([]byte, 0, StorageKeyLength)
+			switch rng.Intn(3) {
+			case 0:
+				stem = append(stem, AccountZone)
+			case 1:
+				stem = append(stem, CodeZone)
+			default:
+				stem = append(stem, StorageZone)
+				stem = append(stem, make([]byte, 32)...)
+				rng.Read(stem[1:])
+			}
+			stem = append(stem, make([]byte, 32)...)
+			rng.Read(stem[len(stem)-32:])
+			// Most stems hold one value, some several.
+			for range 1 + rng.Intn(3)*rng.Intn(4) {
+				value := make([]byte, 32)
+				rng.Read(value)
+				value[0] |= 1
+				set[string(append(stem[:len(stem):len(stem)], byte(rng.Intn(256))))] = value
+			}
+		}
+		keys := make([][]byte, 0, len(set))
+		for k := range set {
+			keys = append(keys, []byte(k))
+		}
+		slices.SortFunc(keys, bytes.Compare)
+		values := make([][]byte, len(keys))
+		for i, k := range keys {
+			values[i] = set[string(k)]
+		}
+		collect := func(out *[]record) OnNode {
+			return func(path []byte, hash common.Hash, blob []byte) {
+				*out = append(*out, record{bytes.Clone(path), bytes.Clone(blob), hash})
+			}
+		}
+		var want []record
+		root := build(NewStackBuilder(collect(&want)), keys, values)
+		for _, workers := range []int{1, 4} {
+			var got []record
+			if r := build(NewParallelStackBuilder(collect(&got), workers), keys, values); r != root {
+				t.Fatalf("%d keys, %d workers: root %x, inline %x", len(keys), workers, r, root)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("%d keys, %d workers: %d records, inline %d", len(keys), workers, len(got), len(want))
+			}
+			for i := range got {
+				if !bytes.Equal(got[i].path, want[i].path) || got[i].hash != want[i].hash || !bytes.Equal(got[i].blob, want[i].blob) {
+					t.Fatalf("%d keys, %d workers: record %d differs from the inline builder's", len(keys), workers, i)
+				}
+			}
+		}
+		if r := build(NewParallelStackBuilder(nil, 2), keys, values); r != root {
+			t.Fatalf("%d keys, hash only: root %x, inline %x", len(keys), r, root)
+		}
+	}
+	if r := NewParallelStackBuilder(nil, 2).Finish(); r != (common.Hash{}) {
+		t.Fatalf("empty parallel builder root %x", r)
+	}
+	// Abandoning a build stops its goroutines.
+	b := NewParallelStackBuilder(func([]byte, common.Hash, []byte) {}, 2)
+	if err := b.Add(BasicDataKey(common.Address{1}), bytes.Repeat([]byte{7}, 32)); err != nil {
+		t.Fatal(err)
+	}
+	b.Stop()
 }
 
 // TestUpdateAccountCodeSizeVsModel pins the history dependence a negative
