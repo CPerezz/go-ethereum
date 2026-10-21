@@ -648,33 +648,38 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// Tree nodes are staged per depth and written only once check 1 has
 	// passed, in key order (see nodeStager).
 	var (
-		builderErr error
-		onNode     func(path []byte, hash common.Hash, blob []byte)
-		nodes      *nodeStager
+		onNode func(path []byte, hash common.Hash, blob []byte)
+		nodes  *nodeStager
 	)
 	if !verifyOnly {
 		if nodes, err = newNodeStager(opts.tmpDir, ingesterOf(chaindb), opts.yield); err != nil {
 			return common.Hash{}, err
 		}
 		defer nodes.close()
-		onNode = func(path []byte, hash common.Hash, blob []byte) {
-			if builderErr != nil {
-				return
-			}
-			builderErr = nodes.add(path, blob)
-		}
+		// The builder's fold goroutine calls this; a staging error
+		// resurfaces when the nodes are written (see nodeStager.wait).
+		onNode = func(path []byte, _ common.Hash, blob []byte) { nodes.add(path, blob) }
 	}
-	builder := bintrie.NewStackBuilder(onNode)
+	builder := bintrie.NewParallelStackBuilder(onNode, opts.workers)
+	defer builder.Stop()
 
 	var (
-		acctSorter  = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // keccak(addr) -> nonce ‖ balance ‖ codeHash
-		slotSorter  = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // keccak(addr) ‖ keccak(slot) -> rlp value
+		acctSorter = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // keccak(addr) -> nonce ‖ balance ‖ codeHash
+		// keccak(addr) ‖ keccak(slot) -> rlp value. Slots are most of the
+		// records: two sorters with half the budget each spill side by side,
+		// where one sorter's single spill held the join up a third of the time
+		// on mainnet. Check 2 merges both.
+		slotSorters = [2]*bintrie.RecordSorter{
+			bintrie.NewRecordSorter(opts.tmpDir, quarter/2, nil),
+			bintrie.NewRecordSorter(opts.tmpDir, quarter/2, nil),
+		}
 		chunkSorter = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // codeHash ‖ index -> chunk
 		codeSizes   = make(map[common.Hash]uint32)
 		stats       = newStats("Importing state")
 	)
 	defer acctSorter.Close()
-	defer slotSorter.Close()
+	defer slotSorters[0].Close()
+	defer slotSorters[1].Close()
 	defer chunkSorter.Close()
 
 	// addSlot records one storage slot everywhere it goes but flat state,
@@ -694,8 +699,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		enc.Reset(nil)
 		enc.WriteBytes(common.TrimLeftZeroes(value[:]))
 		slotRLP = enc.AppendToBytes(slotRLP[:0])
-		stats.slots.Add(1)
-		return slotSorter.Add(slotKey[:], slotRLP)
+		return slotSorters[stats.slots.Add(1)&1].Add(slotKey[:], slotRLP)
 	}
 
 	// sealGroup validates one account's header leaves and records it
@@ -841,7 +845,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// The pass is a pipeline: a decoder goroutine reads the snapshot into
 	// batches, which the tree builder's goroutine and this loop each consume
 	// in order, so decoding, hashing and joining overlap.
-	pipe := startLeafPipeline(leaves, builder, &builderErr, opts.yield)
+	pipe := startLeafPipeline(leaves, builder, opts.yield)
 	defer pipe.stop()
 	var (
 		batch *leafBatch
@@ -1010,9 +1014,6 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	// Check 1: the leaves must rebuild to the claimed root. A self-converter
 	// claims none: its build is the tree.
 	root := builder.Finish()
-	if builderErr != nil {
-		return common.Hash{}, builderErr
-	}
 	if own == nil {
 		if root != snap.root {
 			return common.Hash{}, fmt.Errorf("snapshot leaves rebuild to %x, its pbtRoot claims %x", root, snap.root)
@@ -1094,7 +1095,10 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	if err != nil {
 		return common.Hash{}, err
 	}
-	slotStream, err := slotSorter.Sort()
+	if err := slotSorters[0].Absorb(slotSorters[1]); err != nil {
+		return common.Hash{}, err
+	}
+	slotStream, err := slotSorters[0].Sort()
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -1110,7 +1114,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		return common.Hash{}, err
 	}
 	acctSorter.Close() // likewise, drained by check 2
-	slotSorter.Close()
+	slotSorters[0].Close()
 	if got != anchorRoot {
 		return common.Hash{}, fmt.Errorf("the leaves re-derive merkle root %x, the anchor commits %x", got, anchorRoot)
 	}
@@ -1494,10 +1498,9 @@ type leafPipeline struct {
 	g      *errgroup.Group
 }
 
-// startLeafPipeline starts reading src and feeding builder; *builderErr is
-// the error builder's node callback records. Both pause between batches while
-// the node processes a block (y).
-func startLeafPipeline(src leafReader, builder *bintrie.StackBuilder, builderErr *error, y *blockYield) *leafPipeline {
+// startLeafPipeline starts reading src and feeding builder. Both pause
+// between batches while the node processes a block (y).
+func startLeafPipeline(src leafReader, builder *bintrie.StackBuilder, y *blockYield) *leafPipeline {
 	ctx, cancel := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 	p := &leafPipeline{
@@ -1557,9 +1560,6 @@ func startLeafPipeline(src leafReader, builder *bintrie.StackBuilder, builderErr
 			for i := range b.values {
 				if err := builder.Add(b.key(i), b.values[i][:]); err != nil {
 					return err
-				}
-				if *builderErr != nil {
-					return *builderErr
 				}
 			}
 			p.release(b)
