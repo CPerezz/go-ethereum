@@ -216,8 +216,8 @@ func (t *tableFamily) abort() {
 	os.RemoveAll(t.dir)
 }
 
-// flatWriters writes the flat state check 2 re-derives: storage rows, then
-// account rows, each family through its own writer.
+// flatWriters writes the flat state check 2 re-derives, storage and account
+// rows each through its own writer.
 type flatWriters struct{ storage, accounts familyWriter }
 
 func newFlatWriters(chaindb, pbtdb ethdb.Database, tmpDir string, y *blockYield) (*flatWriters, error) {

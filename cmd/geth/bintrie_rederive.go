@@ -17,7 +17,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -110,10 +109,9 @@ func (h *heldStream) advance() { h.key, h.value = nil, nil }
 // The calling goroutine walks both streams in keccak order; workers fold the
 // storage tries and one more goroutine the account trie, taking the storage
 // roots in account order. With flat writers, the walk also writes the flat
-// state: storage rows as it goes, account rows spilled to a file under tmpDir
-// and written after the last storage row, each family through its own writer.
-// Everything is committed by return.
-func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, tmpDir string, workers int, total uint64, y *blockYield) (common.Hash, error) {
+// state as it goes, each family through its own writer. Everything is
+// committed by return.
+func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, workers int, total uint64, y *blockYield) (common.Hash, error) {
 	workers = max(workers, 1)
 	var (
 		g, gctx   = errgroup.WithContext(ctx)
@@ -146,7 +144,7 @@ func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStre
 			}
 			close(accts)
 		}()
-		return walkMerkleRecords(gctx, accounts, slots, flat, tmpDir, total, jobs, free, accts, acctsFree, y)
+		return walkMerkleRecords(gctx, accounts, slots, flat, total, jobs, free, accts, acctsFree, y)
 	})
 	if err := g.Wait(); err != nil {
 		return common.Hash{}, err
@@ -179,33 +177,25 @@ type foldAccount struct {
 }
 
 // walkMerkleRecords joins the account and slot streams in keccak order,
-// writing the flat state if batch is set, and hands the slots to the fold
+// writing the flat state if flat is set, and hands the slots to the fold
 // workers and the accounts to the account trie: a job of whole accounts to
 // one worker, the next job to the next. total is the accounts and slots
 // expected, for progress reports.
-func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, tmpDir string, total uint64,
+func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, total uint64,
 	jobs []chan *foldBatch, free chan *foldBatch, accts, acctsFree chan []foldAccount, y *blockYield) error {
 	var (
 		slotHeld   = &heldStream{stream: slots}
 		walked     atomic.Uint64 // accounts and slots
 		walkedAccs uint64
-		acctRows   *spillFile
 		worker     int
 		cur        *foldBatch
 		pending    []foldAccount
-		// Encodings and keys, reused: the writers and the spill copy them.
+		// Encodings and keys, reused: the writers copy them.
 		enc          = rlp.NewEncoderBuffer(nil)
 		slim, rowKey []byte
 	)
 	prog := startProgress("Re-deriving merkle state", "records", total, walked.Load)
 	defer prog.stop()
-	if flat != nil {
-		var err error
-		if acctRows, err = newSpillFile(tmpDir, "bintrie-acctrows-*"); err != nil {
-			return err
-		}
-		defer acctRows.close()
-	}
 	take := func() error {
 		if err := y.pause(ctx); err != nil {
 			return err
@@ -307,9 +297,10 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 		if acct.storage {
 			cur.accounts = append(cur.accounts, len(cur.keys))
 		}
-		if acctRows != nil {
+		if flat != nil {
 			slim = appendAccountRLP(slim[:0], &enc, &acct, types.EmptyRootHash, true)
-			if err := acctRows.add(akey, slim); err != nil {
+			rowKey = append(append(rowKey[:0], rawdb.SnapshotAccountPrefix...), akey...)
+			if err := flat.accounts.put(rowKey, slim); err != nil {
 				return err
 			}
 		}
@@ -356,27 +347,7 @@ func walkMerkleRecords(ctx context.Context, accounts, slots *bintrie.RecordStrea
 	if err := flat.storage.commit(); err != nil {
 		return err
 	}
-	var rows atomic.Uint64
-	prog = startProgress("Writing flat accounts", "accounts", walkedAccs, rows.Load)
-	defer prog.stop()
-	err := acctRows.replay(bufio.NewReaderSize(nil, 256<<10), func(hash, row []byte) error {
-		rowKey = append(append(rowKey[:0], rawdb.SnapshotAccountPrefix...), hash...)
-		if err := flat.accounts.put(rowKey, row); err != nil {
-			return err
-		}
-		if rows.Add(1)%uint64(foldBatchSize) == 0 {
-			return y.pause(ctx)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if err := flat.accounts.commit(); err != nil {
-		return err
-	}
-	prog.finish("Wrote flat accounts", "accounts", rows.Load())
-	return nil
+	return flat.accounts.commit()
 }
 
 // foldStorage hashes the storage tries of the accounts it is sent and

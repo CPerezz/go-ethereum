@@ -1105,7 +1105,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		}
 		defer flat.abort()
 	}
-	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, flat, opts.tmpDir, opts.workers, stats.accounts.Load()+stats.slots.Load(), opts.yield)
+	got, err := rederiveMerkleRoot(ctx, acctStream, slotStream, flat, opts.workers, stats.accounts.Load()+stats.slots.Load(), opts.yield)
 	if err != nil {
 		return common.Hash{}, err
 	}
