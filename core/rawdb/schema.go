@@ -174,12 +174,13 @@ var (
 	// (b) In-memory trie node journal
 	// (c) Persistent state ID
 	// (d) State ID lookups, etc.
-	PBTPrefix = []byte("b")
+	// It sorts after every other key, so no table of the node's own data spans
+	// the namespace: tables built for it and ingested land in the bottom level,
+	// whatever the database's format.
+	PBTPrefix = []byte{0xff}
 
 	// PBTKeyFamilies lists the leading bytes of every key family under the
-	// PBTPrefix table. The prefix is shared with block bodies, whose keys
-	// continue with an 8-byte block number, so namespace scans must go family
-	// by family; no family byte is a reachable number byte before block 2^62.
+	// PBTPrefix table; namespace scans go family by family.
 	PBTKeyFamilies = [][]byte{
 		TrieNodeAccountPrefix,   // tree nodes
 		TrieNodeStoragePrefix,   // unused single-tree, scanned defensively
