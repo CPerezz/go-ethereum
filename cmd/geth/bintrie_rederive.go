@@ -113,13 +113,16 @@ func (h *heldStream) advance() { h.key, h.value = nil, nil }
 // committed by return.
 func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStream, flat *flatWriters, workers int, total uint64, y *blockYield) (common.Hash, error) {
 	workers = max(workers, 1)
+	// The queues let the walk run well ahead of the account fold, which takes
+	// storage roots in job order: shallow ones left the storage workers idle
+	// whenever one job ran long.
 	var (
 		g, gctx   = errgroup.WithContext(ctx)
 		jobs      = make([]chan *foldBatch, workers)
 		roots     = make([]chan []common.Hash, workers)
-		free      = make(chan *foldBatch, 3*workers)
-		accts     = make(chan []foldAccount, 4)
-		acctsFree = make(chan []foldAccount, 6)
+		free      = make(chan *foldBatch, 8*workers)
+		accts     = make(chan []foldAccount, 32)
+		acctsFree = make(chan []foldAccount, 34)
 		root      common.Hash
 	)
 	for range cap(free) {
@@ -129,7 +132,7 @@ func rederiveMerkleRoot(ctx context.Context, accounts, slots *bintrie.RecordStre
 		acctsFree <- make([]foldAccount, 0, foldBatchSize)
 	}
 	for i := range workers {
-		jobs[i], roots[i] = make(chan *foldBatch, 2), make(chan []common.Hash, 2)
+		jobs[i], roots[i] = make(chan *foldBatch, 8), make(chan []common.Hash, 8)
 		g.Go(func() error { return foldStorage(gctx, jobs[i], roots[i], free, y) })
 	}
 	g.Go(func() error {
