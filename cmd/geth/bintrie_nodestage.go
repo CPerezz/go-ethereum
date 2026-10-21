@@ -47,6 +47,7 @@ import (
 type nodeStager struct {
 	dir    string
 	ing    ethdb.TableIngester  // nil: spill files and a replay
+	y      *blockYield          // the tables' builders stand aside for its blocks
 	depths map[int]*spillFile   // owned by stage until wait returns
 	tables map[int]*tableFamily // likewise, with ing
 	key    []byte               // stage's, a node's key in the namespace
@@ -59,8 +60,8 @@ type nodeStager struct {
 }
 
 // newNodeStager stages in a fresh directory under tmpDir: tables ing ingests,
-// if set, or spill files.
-func newNodeStager(tmpDir string, ing ethdb.TableIngester) (*nodeStager, error) {
+// if set, built standing aside for y's blocks, or spill files.
+func newNodeStager(tmpDir string, ing ethdb.TableIngester, y *blockYield) (*nodeStager, error) {
 	dir, err := os.MkdirTemp(tmpDir, "bintrie-nodes-")
 	if err != nil {
 		return nil, err
@@ -68,6 +69,7 @@ func newNodeStager(tmpDir string, ing ethdb.TableIngester) (*nodeStager, error) 
 	s := &nodeStager{
 		dir:    dir,
 		ing:    ing,
+		y:      y,
 		depths: make(map[int]*spillFile),
 		tables: make(map[int]*tableFamily),
 		work:   make(chan *recordBatch, 4),
@@ -117,7 +119,7 @@ func (s *nodeStager) write(path, blob []byte) error {
 			if err != nil {
 				return err
 			}
-			t = newTableFamily(s.ing, dir)
+			t = newTableFamily(s.ing, dir, s.y)
 			s.tables[depth] = t
 		}
 		s.key = append(append(s.key[:0], rawdb.TrieNodeAccountPrefix...), path...)

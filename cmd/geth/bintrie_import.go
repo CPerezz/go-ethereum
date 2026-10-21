@@ -653,7 +653,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		nodes      *nodeStager
 	)
 	if !verifyOnly {
-		if nodes, err = newNodeStager(opts.tmpDir, ingesterOf(chaindb)); err != nil {
+		if nodes, err = newNodeStager(opts.tmpDir, ingesterOf(chaindb), opts.yield); err != nil {
 			return common.Hash{}, err
 		}
 		defer nodes.close()
@@ -1100,7 +1100,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	}
 	var flat *flatWriters // the flat state check 2 writes; none when only verifying
 	if !verifyOnly {
-		if flat, err = newFlatWriters(chaindb, pbtdb, opts.tmpDir); err != nil {
+		if flat, err = newFlatWriters(chaindb, pbtdb, opts.tmpDir, opts.yield); err != nil {
 			return common.Hash{}, err
 		}
 		defer flat.abort()

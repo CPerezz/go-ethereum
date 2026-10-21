@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,7 +44,7 @@ type familyWriter interface {
 // node's own writes share the memtables with batches, so every flushed table
 // would span them and the family's keys alike, and the database would rewrite
 // the family on each level down.
-func newFamilyWriter(chaindb, pbtdb ethdb.Database, tmpDir string) (familyWriter, error) {
+func newFamilyWriter(chaindb, pbtdb ethdb.Database, tmpDir string, y *blockYield) (familyWriter, error) {
 	ing := ingesterOf(chaindb)
 	if ing == nil {
 		return &batchFamily{batch: pbtdb.NewBatch()}, nil
@@ -52,7 +53,7 @@ func newFamilyWriter(chaindb, pbtdb ethdb.Database, tmpDir string) (familyWriter
 	if err != nil {
 		return nil, err
 	}
-	return newTableFamily(ing, dir), nil
+	return newTableFamily(ing, dir, y), nil
 }
 
 // ingesterOf returns the table ingester behind db, nil if its store has none.
@@ -94,10 +95,11 @@ const familyTableBytes = 128 << 20
 // other, which commit ingests in one call: a family's tables follow each
 // other in key order, so none overlap. put only copies records into batches;
 // a goroutine of the family's own builds the tables, off the writer's
-// critical path.
+// critical path, and stands aside while the node processes a block.
 type tableFamily struct {
 	db  ethdb.TableIngester
 	dir string // on the database's filesystem, the tables are linked in
+	y   *blockYield
 
 	cur        *recordBatch
 	work, free chan *recordBatch
@@ -106,10 +108,11 @@ type tableFamily struct {
 	paths      []string              // owned by build until done is closed
 }
 
-func newTableFamily(db ethdb.TableIngester, dir string) *tableFamily {
+func newTableFamily(db ethdb.TableIngester, dir string, y *blockYield) *tableFamily {
 	t := &tableFamily{
 		db:   db,
 		dir:  dir,
+		y:    y,
 		work: make(chan *recordBatch, 4),
 		free: make(chan *recordBatch, 5),
 		done: make(chan struct{}),
@@ -134,6 +137,7 @@ func (t *tableFamily) build() {
 		err  error
 	)
 	for b := range t.work {
+		t.y.pause(context.Background())
 		for i := 0; err == nil && i < b.len(); i++ {
 			if w == nil {
 				path := filepath.Join(t.dir, fmt.Sprintf("%06d.sst", len(t.paths)))
@@ -216,12 +220,12 @@ func (t *tableFamily) abort() {
 // account rows, each family through its own writer.
 type flatWriters struct{ storage, accounts familyWriter }
 
-func newFlatWriters(chaindb, pbtdb ethdb.Database, tmpDir string) (*flatWriters, error) {
-	storage, err := newFamilyWriter(chaindb, pbtdb, tmpDir)
+func newFlatWriters(chaindb, pbtdb ethdb.Database, tmpDir string, y *blockYield) (*flatWriters, error) {
+	storage, err := newFamilyWriter(chaindb, pbtdb, tmpDir, y)
 	if err != nil {
 		return nil, err
 	}
-	accounts, err := newFamilyWriter(chaindb, pbtdb, tmpDir)
+	accounts, err := newFamilyWriter(chaindb, pbtdb, tmpDir, y)
 	if err != nil {
 		storage.abort()
 		return nil, err
