@@ -664,14 +664,22 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	defer builder.Stop()
 
 	var (
-		acctSorter  = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // keccak(addr) -> nonce ‖ balance ‖ codeHash
-		slotSorter  = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // keccak(addr) ‖ keccak(slot) -> rlp value
+		acctSorter = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // keccak(addr) -> nonce ‖ balance ‖ codeHash
+		// keccak(addr) ‖ keccak(slot) -> rlp value. Slots are most of the
+		// records: two sorters with half the budget each spill side by side,
+		// where one sorter's single spill held the join up a third of the time
+		// on mainnet. Check 2 merges both.
+		slotSorters = [2]*bintrie.RecordSorter{
+			bintrie.NewRecordSorter(opts.tmpDir, quarter/2, nil),
+			bintrie.NewRecordSorter(opts.tmpDir, quarter/2, nil),
+		}
 		chunkSorter = bintrie.NewRecordSorter(opts.tmpDir, quarter, nil) // codeHash ‖ index -> chunk
 		codeSizes   = make(map[common.Hash]uint32)
 		stats       = newStats("Importing state")
 	)
 	defer acctSorter.Close()
-	defer slotSorter.Close()
+	defer slotSorters[0].Close()
+	defer slotSorters[1].Close()
 	defer chunkSorter.Close()
 
 	// addSlot records one storage slot everywhere it goes but flat state,
@@ -691,8 +699,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		enc.Reset(nil)
 		enc.WriteBytes(common.TrimLeftZeroes(value[:]))
 		slotRLP = enc.AppendToBytes(slotRLP[:0])
-		stats.slots.Add(1)
-		return slotSorter.Add(slotKey[:], slotRLP)
+		return slotSorters[stats.slots.Add(1)&1].Add(slotKey[:], slotRLP)
 	}
 
 	// sealGroup validates one account's header leaves and records it
@@ -1088,7 +1095,10 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 	if err != nil {
 		return common.Hash{}, err
 	}
-	slotStream, err := slotSorter.Sort()
+	if err := slotSorters[0].Absorb(slotSorters[1]); err != nil {
+		return common.Hash{}, err
+	}
+	slotStream, err := slotSorters[0].Sort()
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -1104,7 +1114,7 @@ func importState(ctx context.Context, chaindb ethdb.Database, opts importOptions
 		return common.Hash{}, err
 	}
 	acctSorter.Close() // likewise, drained by check 2
-	slotSorter.Close()
+	slotSorters[0].Close()
 	if got != anchorRoot {
 		return common.Hash{}, fmt.Errorf("the leaves re-derive merkle root %x, the anchor commits %x", got, anchorRoot)
 	}
