@@ -167,8 +167,8 @@ func DeleteMerkleState(db ethdb.KeyValueStore, interrupt <-chan struct{}) error 
 }
 
 // DeletePBTState deletes the binary tree state: every PBTKeyFamilies range
-// inside the PBTPrefix table, never the bare prefix, which block bodies
-// share. Interrupt stops it between ranges; a rerun finishes the job.
+// inside the PBTPrefix table. Interrupt stops it between ranges; a rerun
+// finishes the job.
 func DeletePBTState(db ethdb.Database, interrupt <-chan struct{}) error {
 	var (
 		pbtdb = NewTable(db, string(PBTPrefix))

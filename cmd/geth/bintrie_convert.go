@@ -1060,8 +1060,7 @@ func emitCodeChunks(codeHash common.Hash, code []byte, emit func([]byte, [32]byt
 }
 
 // hasBinaryTrieState reports whether anything sits in the binary tree
-// namespace. Probed per key family: the bare prefix is shared with block
-// bodies.
+// namespace, probed per key family.
 func hasBinaryTrieState(chaindb ethdb.Database) (bool, error) {
 	pbtdb := rawdb.NewTable(chaindb, string(rawdb.PBTPrefix))
 	for _, family := range rawdb.PBTKeyFamilies {
@@ -1080,9 +1079,9 @@ func hasBinaryTrieState(chaindb ethdb.Database) (bool, error) {
 	return false, nil
 }
 
-// wipeBinaryTrieState clears the binary tree state: the key families (the
-// bare prefix is shared with block bodies), the PBT history freezers, and
-// the journal file in triedbDir. Nothing may hold the namespace open.
+// wipeBinaryTrieState clears the binary tree state: the key families, the
+// PBT history freezers, and the journal file in triedbDir. Nothing may hold
+// the namespace open.
 func wipeBinaryTrieState(chaindb ethdb.Database, triedbDir string) error {
 	// Anchor, then bookkeeping, then state: any crash prefix leaves state the
 	// follower refuses, never an anchor or a position it would bind to it.
