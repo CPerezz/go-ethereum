@@ -18,6 +18,7 @@
 package pebble
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -30,11 +31,10 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
-	"github.com/cockroachdb/pebble/v2/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/v2/sstable"
-	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/internal/pagecache"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 )
@@ -579,12 +579,46 @@ func (d *Database) Path() string {
 // the database's table format with the bottom level's options: tables of a
 // key range the database holds nothing in land there.
 func (d *Database) NewTableWriter(path string) (ethdb.TableWriter, error) {
-	f, err := vfs.Default.Create(path, vfs.WriteCategoryUnspecified)
+	f, err := newTableFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return tableWriter{sstable.NewWriter(objstorageprovider.NewFileWritable(f), d.tableOpts)}, nil
+	return tableWriter{sstable.NewWriter(f, d.tableOpts)}, nil
 }
+
+// tableFile is a table's file, written behind (internal/pagecache): a bulk
+// load's tables, written beside a running node, neither pile up as dirty pages
+// nor crowd its pages out of the page cache. Finish syncs it for Ingest.
+type tableFile struct {
+	f *os.File
+	w *bufio.Writer
+}
+
+func newTableFile(path string) (*tableFile, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return &tableFile{f: f, w: bufio.NewWriterSize(pagecache.NewWriter(f), 256<<10)}, nil
+}
+
+func (t *tableFile) Write(p []byte) error {
+	_, err := t.w.Write(p)
+	return err
+}
+
+func (t *tableFile) Finish() error {
+	err := t.w.Flush()
+	if err == nil {
+		err = t.f.Sync()
+	}
+	if cerr := t.f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+func (t *tableFile) Abort() { t.f.Close() }
 
 // tableWriter is an sstable.Writer as an ethdb.TableWriter.
 type tableWriter struct{ *sstable.Writer }

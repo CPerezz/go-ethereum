@@ -31,9 +31,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
-	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/vfs"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
@@ -512,11 +510,11 @@ func (d *V1Database) Path() string {
 // the database's table format with the bottom level's options: tables of a
 // key range the database holds nothing in land there.
 func (d *V1Database) NewTableWriter(path string) (ethdb.TableWriter, error) {
-	f, err := vfs.Default.Create(path)
+	f, err := newTableFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return v1TableWriter{sstable.NewWriter(objstorageprovider.NewFileWritable(f), d.tableOpts)}, nil
+	return v1TableWriter{sstable.NewWriter(f, d.tableOpts)}, nil
 }
 
 // v1TableWriter is a pebble v1 sstable.Writer as an ethdb.TableWriter.
