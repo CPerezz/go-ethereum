@@ -101,6 +101,13 @@ func WritePBTMigrationDone(db ethdb.KeyValueWriter) {
 	}
 }
 
+// DeletePBTMigrationDone reopens the migration.
+func DeletePBTMigrationDone(db ethdb.KeyValueWriter) {
+	if err := db.Delete(pbtMigrationDoneKey); err != nil {
+		log.Crit("Failed to delete migration done marker", "err", err)
+	}
+}
+
 // ReadPBTMerkleDisposed reports whether the merkle state is gone or going.
 func ReadPBTMerkleDisposed(db ethdb.KeyValueReader) bool {
 	data, _ := db.Get(pbtMerkleDisposedKey)

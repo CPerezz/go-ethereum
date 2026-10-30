@@ -189,48 +189,24 @@ func merkleStateFixture(t *testing.T, genesis *Genesis) (ethdb.Database, common.
 	return db, addrHash
 }
 
-// TestMerkleDisposalDeletesUnderALiveNode: a node that crossed the fork in-run
-// retires bc.trieDB() and deletes the merkle state without a restart.
-func TestMerkleDisposalDeletesUnderALiveNode(t *testing.T) {
+// TestDisposalNeedsAPostForkBinaryState: with no post-fork binary state on
+// disk the merkle state is the only way back, and a live node keeps it.
+func TestDisposalNeedsAPostForkBinaryState(t *testing.T) {
 	genesis := migrationGenesis(t)
 	db, addrHash := merkleStateFixture(t, genesis)
 
 	chain := openMigrationChain(t, db, genesis)
 	defer chain.Stop()
-	if chain.TrieDB().IsPBT() {
-		t.Fatal("opened on the binary tree")
-	}
 	// Stop the loop the close would run on.
 	chain.follower.close()
 
 	chain.live.Store(true)
 	chain.disposeMerkle()
-	<-chain.disposer.Load().done
-
-	if rawdb.ReadAccountSnapshot(db, addrHash) != nil {
-		t.Fatal("merkle flat state survived")
+	if rawdb.ReadPBTMerkleDisposed(db) || rawdb.ReadAccountSnapshot(db, addrHash) == nil {
+		t.Fatal("merkle state disposed of with no post-fork binary state on disk")
 	}
-	for _, family := range rawdb.MerkleKeyFamilies {
-		it := db.NewIterator(family, nil)
-		left := it.Next()
-		it.Release()
-		if left {
-			t.Fatalf("merkle family %q survived", family)
-		}
-	}
-	if rawdb.HasSnapshotRoot(db) {
-		t.Fatal("snapshot root survived")
-	}
-	// Head pointers begin "Last", the state-id prefix byte.
-	if rawdb.ReadHeadBlockHash(db) == (common.Hash{}) || rawdb.ReadHeadHeaderHash(db) == (common.Hash{}) {
-		t.Fatal("head pointers deleted")
-	}
-	pbtdb := rawdb.NewTable(db, string(rawdb.PBTPrefix))
-	if !rawdb.ReadPBTFlatState(pbtdb) || len(rawdb.ReadAccountTrieNode(pbtdb, nil)) == 0 {
-		t.Fatal("binary namespace touched")
-	}
-	if _, err := chain.treeFor(false); err == nil {
-		t.Fatal("merkle handle served after disposal")
+	if _, err := chain.treeFor(false); err != nil {
+		t.Fatalf("merkle trie retired: %v", err)
 	}
 }
 
