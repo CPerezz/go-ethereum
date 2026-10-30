@@ -945,6 +945,34 @@ func TestCommit(t *testing.T) {
 	}
 }
 
+// TestPersist: once Persist returns, the state below the kept layer is on
+// disk, flushed asynchronously as in production. Below the bottom diff layer
+// that state is the disk layer's unflushed buffer, and Persist fails.
+func TestPersist(t *testing.T) {
+	maxDiffLayers = 4
+	defer func() {
+		maxDiffLayers = 128
+	}()
+	buffer := 16 * 1024 * 1024 // nothing flushes on its own
+	tester := newTester(t, &testerConfig{layers: 6, writeBuffer: &buffer})
+	defer tester.release()
+	tester.db.config.NoAsyncFlush = false
+
+	// States 1-2 are in the disk layer's buffer, 3-6 in diff layers.
+	if err := tester.db.Persist(tester.roots[2]); err == nil {
+		t.Fatal("persisted a state still in the write buffer")
+	}
+	if err := tester.db.Persist(tester.roots[4]); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if id := rawdb.ReadPersistentStateID(tester.db.diskdb); id != 4 {
+		t.Fatalf("persisted state %d, want 4", id)
+	}
+	if err := tester.verifyState(tester.lastHash()); err != nil {
+		t.Fatalf("head state lost: %v", err)
+	}
+}
+
 func TestJournal(t *testing.T) {
 	testJournal(t, "")
 	testJournal(t, filepath.Join(t.TempDir(), strconv.Itoa(rand.Intn(10000))))

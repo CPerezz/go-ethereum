@@ -77,13 +77,13 @@ func (bc *BlockChain) disposeMerkle() {
 	bc.startMerkleDisposal()
 }
 
-// persistBinary puts the binary state of the head's parent on disk, keeping
-// the head and anything above it live. Nothing to do below the second
-// post-fork block, or when the parent is at or below the disk layer.
+// persistBinary puts the binary state of the head's parent, a post-fork block,
+// on disk, keeping the head and anything above it live. Nothing to do when the
+// parent is at or below the disk layer.
 func (bc *BlockChain) persistBinary(head *types.Header) error {
 	parent := bc.GetHeader(head.ParentHash, head.Number.Uint64()-1)
 	if parent == nil || !bc.chainConfig.IsBinaryTrie(parent.Number, parent.Time) {
-		return nil
+		return errors.New("no post-fork block below the head to persist")
 	}
 	pbtdb := rawdb.NewTable(bc.db, string(rawdb.PBTPrefix))
 	if id := rawdb.ReadStateID(pbtdb, parent.Root); id != nil && *id <= rawdb.ReadPersistentStateID(pbtdb) {

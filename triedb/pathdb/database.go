@@ -401,8 +401,8 @@ func (db *Database) Commit(root common.Hash, report bool) error {
 
 // Persist flattens every layer below the one with the given root into the
 // disk layer and writes it out, keeping that layer and its descendants. Unlike
-// Commit it is safe on a live database: the state of the layer's parent lands
-// on disk without waiting for the write buffer to fill.
+// Commit it is safe on a live database. It returns once the state of the
+// layer's parent is on disk, and fails if it is not.
 func (db *Database) Persist(root common.Hash) error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
@@ -410,7 +410,19 @@ func (db *Database) Persist(root common.Hash) error {
 	if err := db.modifyAllowed(); err != nil {
 		return err
 	}
-	return db.tree.persist(root)
+	if err := db.tree.persist(root); err != nil {
+		return err
+	}
+	// The parent is the disk layer now. One that already was is not written:
+	// its state is on disk only if its buffer was flushed.
+	disk := db.tree.bottom()
+	if err := disk.waitFlush(); err != nil {
+		return err
+	}
+	if id := disk.stateID(); rawdb.ReadPersistentStateID(db.diskdb) < id {
+		return fmt.Errorf("state %d is in the write buffer, not on disk", id)
+	}
+	return nil
 }
 
 // Disable deactivates the database and invalidates all available state layers
