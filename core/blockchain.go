@@ -593,6 +593,7 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 						return nil, err
 					}
 					isPBT, route = false, routeMerkle
+					rawdb.DeletePBTMigrationDone(db)
 				}
 				log.Warn("Head state missing, repairing", "number", head.Number, "hash", head.Hash())
 				if _, err := bc.setHeadBeyondRoot(head.Number.Uint64(), 0, common.Hash{}, true); err != nil {
